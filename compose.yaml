@@ -1,0 +1,49 @@
+# compose.yaml — środowisko dev/demo (podman compose lub docker compose)
+#
+#   podman compose up --build           # zbuduj i uruchom
+#   podman compose up -d                # w tle
+#   podman compose logs -f app
+#   podman compose down
+#
+# UI: http://localhost:8501
+#
+# Tryb dev bind-montuje całe repo (z .git), więc:
+#   - Streamlit przeładowuje się na żywo gdy instancje T1–T5 dopisują kod,
+#   - sandbox (apply_edit → pytest → git_commit) działa na realnym repo z historią git.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: legacy-documenter:dev
+    container_name: legacy-documenter
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env.docker          # skopiuj z .env.docker.example i uzupełnij klucze Azure
+    environment:
+      # Wartości domyślne (env_file ma pierwszeństwo, jeśli ustawione).
+      LLM_PROVIDER: "azure"
+      REPO_PATH: "sample"
+      STREAMLIT_PORT: "8501"
+    volumes:
+      # Dev: żywy kod + historia git (sandbox/commit). Do produkcji usuń ten mount
+      # i polegaj na kodzie zapieczonym w obrazie.
+      - ./:/app
+      # Cache indeksu — przeżywa restart kontenera (indeks budowany raz, reindex po Merge PR).
+      - index-cache:/app/.index_cache
+      # Opcjonalnie: zewnętrzne repo do analizy. Ustaw REPO_PATH=/workspace/<repo>.
+      # - ./workspace:/workspace
+    # Health na poziomie compose — działa niezależnie od formatu obrazu (OCI ignoruje
+    # HEALTHCHECK z Containerfile; compose-level działa zawsze).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+    restart: unless-stopped
+
+volumes:
+  index-cache:

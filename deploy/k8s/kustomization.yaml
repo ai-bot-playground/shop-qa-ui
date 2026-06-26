@@ -1,0 +1,21 @@
+# Spina manifesty. Zastosuj: kubectl apply -k deploy/k8s
+# (secret.example.yaml świadomie POMINIĘTY — sekrety twórz osobno, patrz README.md)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: legacy-documenter
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: legacy-documenter
+
+# images:
+#   - name: legacy-documenter
+#     newName: myregistry.azurecr.io/legacy-documenter
+#     newTag: "1.0.0"

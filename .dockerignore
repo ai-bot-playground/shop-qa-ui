@@ -1,0 +1,44 @@
+# Czytane zarówno przez `podman build` jak i `docker build`.
+# Cel: mały, deterministyczny kontekst budowania.
+
+# VCS — UWAGA: w trybie dev .git jest podmontowywany bind-mountem (compose.yaml),
+# więc sandbox/git_commit działa mimo wykluczenia z obrazu.
+.git
+.gitignore
+
+# Wirtualne środowiska / podprojekty testowe
+test-endpoint/.venv
+**/.venv
+**/venv
+.venv
+
+# legacy-satchmo: przyszły cel indeksowania (gdy dojdzie zapis wyników analizy).
+# Na razie nie trafia do obrazu — używamy sample/order_service.
+# Gdy będzie potrzebny: zmień na `legacy-satchmo/.git` (wpiecze kod bez nested .git).
+legacy-satchmo
+
+# Artefakty Pythona
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+
+# Sekrety / lokalne env (do obrazu NIE trafiają — wstrzykiwane runtime'owo)
+.env
+.env.*
+!.env.docker.example
+!.env.example
+
+# IDE / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Dokumentacja archiwalna i PDF jury — niepotrzebne w runtime
+docs/_archive
+example from jury/*.pdf

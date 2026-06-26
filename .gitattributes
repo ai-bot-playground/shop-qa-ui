@@ -1,0 +1,7 @@
+# Skrypty powłoki MUSZĄ mieć końce linii LF — inaczej CRLF z Windows
+# psuje shebang i obraz kontenera nie startuje.
+*.sh            text eol=lf
+docker/entrypoint.sh text eol=lf
+Containerfile   text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf

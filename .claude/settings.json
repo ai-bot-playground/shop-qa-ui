@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\bartlomiej.szczotka\\\\projects\\\\acc-ai-hackathon\" -Force)",
+      "Bash(Select-Object Name, FullName, PSIsContainer)",
+      "Bash(gh auth *)",
+      "Bash(git remote *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/check_py.py"
+          }
+        ]
+      }
+    ]
+  }
+}

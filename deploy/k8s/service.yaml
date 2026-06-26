@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-documenter
+  namespace: legacy-documenter
+  labels:
+    app.kubernetes.io/name: legacy-documenter
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: legacy-documenter
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

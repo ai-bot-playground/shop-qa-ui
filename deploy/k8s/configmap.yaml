@@ -1,0 +1,17 @@
+# Konfiguracja jawna (NIE-sekretna). Klucze API → secret.example.yaml.
+# Nazwy zgodne z kodem aplikacji (src/agent.py).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: legacy-documenter-config
+  namespace: legacy-documenter
+data:
+  LLM_PROVIDER: "azure"
+  # Model MOCNY (aktywny) — Opus 4.8, analiza/Q&A
+  AZURE_AI_ENDPOINT: "https://ai-remik.services.ai.azure.com/anthropic"
+  AZURE_AI_DEPLOYMENT: "claude-opus-4-8"
+  # Model MAŁY (placeholder w configu — kod jeszcze nie używa) — GPT-5.4-mini
+  AZURE_AI_DEPLOYMENT_FAST: "gpt-5.4-mini"
+  # Repo docelowe (docelowo legacy-satchmo, gdy będzie zapis wyników analizy)
+  REPO_PATH: "sample/order_service"
+  STREAMLIT_PORT: "8501"

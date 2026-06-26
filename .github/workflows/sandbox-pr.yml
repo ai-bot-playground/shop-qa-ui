@@ -1,0 +1,107 @@
+name: AI Sandbox — validate & PR to develop
+
+# SUPERSEDED for the shop integration: real changes proposed by shop-qa-ui are
+# validated by the SHOP's preprod-gate (PR to ai-bot-playground/<service> on
+# main → component → build → deploy kind-preprod → acceptance), NOT by this
+# workflow. Kept manual-only for the legacy Python sample flow. Auto-trigger on
+# ai-sandbox/** is disabled so it does not misfire if this repo is published.
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Base branch for the PR'
+        default: 'develop'
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sandbox-pr-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: legacy-documenter:ci
+
+jobs:
+  validate-and-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pushed code
+        uses: actions/checkout@v4
+
+      - name: Build app image (Docker)
+        run: docker build -f Containerfile -t "$IMAGE" .
+
+      - name: Engine self-test — seeded bug RED→GREEN (in container)
+        run: |
+          docker run --rm -e PYTHONUTF8=1 \
+            --entrypoint python "$IMAGE" scripts/ci_sandbox_check.py
+
+      - name: Validate committed sample — PR gate (in container)
+        run: |
+          cid=$(docker create -e PYTHONUTF8=1 \
+            --entrypoint python "$IMAGE" scripts/ci_validate_sample.py)
+          set +e
+          docker start -a "$cid"
+          rc=$?
+          set -e
+          docker cp "$cid:/app/ci_report.md" ci_report.md || true
+          docker rm "$cid" >/dev/null
+          exit "$rc"
+
+      - name: Smoke-test the GUI boots (in container)
+        run: CONTAINER_CLI=docker bash scripts/smoke_health.sh "$IMAGE"
+
+      - name: Upload CI report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report
+          path: |
+            ci_report.md
+          if-no-files-found: ignore
+
+      - name: Open PR to develop (or print a ready link)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE="${{ github.event.inputs.target_branch || 'develop' }}"
+          HEAD="${{ github.ref_name }}"
+          TITLE="AI Sandbox: validated fix from ${HEAD}"
+          BODY_FILE=ci_report.md
+          [ -f "$BODY_FILE" ] || echo "AI Sandbox validated the committed change on \`$HEAD\`." > "$BODY_FILE"
+          {
+            echo ""
+            echo "_Branch \`$HEAD\` · run [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_"
+          } >> "$BODY_FILE"
+
+          COMPARE_URL="${{ github.server_url }}/${{ github.repository }}/compare/${BASE}...${HEAD}?expand=1"
+          status="manual"
+
+          if existing=$(gh pr view "$HEAD" --json url -q .url 2>/dev/null) && [ -n "$existing" ]; then
+            echo "PR already exists: $existing"
+            gh pr comment "$HEAD" --body-file "$BODY_FILE" || true
+            url="$existing"; status="exists"
+          elif url=$(gh pr create --base "$BASE" --head "$HEAD" --title "$TITLE" --body-file "$BODY_FILE" 2>pr_err.txt); then
+            echo "PR created: $url"; status="created"
+          else
+            echo "::warning title=Auto-PR blocked::Could not create the PR automatically. Enable 'Allow GitHub Actions to create and approve pull requests' (Settings → Actions → General → Workflow permissions), or open it via the link below."
+            cat pr_err.txt 2>/dev/null || true
+            url="$COMPARE_URL"
+          fi
+
+          {
+            echo "### Pull Request to \`$BASE\`"
+            echo ""
+            echo "- Validated branch: \`$HEAD\` (all container tests green)"
+            if [ "$status" = "created" ]; then
+              echo "- ✅ PR created automatically: $url"
+            elif [ "$status" = "exists" ]; then
+              echo "- ♻️ PR already open: $url"
+            else
+              echo "- 📝 Auto-PR is disabled for Actions — open it here: $url"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

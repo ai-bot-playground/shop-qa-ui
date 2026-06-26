@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: legacy-documenter
+  namespace: legacy-documenter
+  labels:
+    app.kubernetes.io/name: legacy-documenter
+spec:
+  replicas: 1                     # Streamlit trzyma stan sesji w pamięci — skalowanie
+                                  # poziome wymaga sticky sessions / zewnętrznego store.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: legacy-documenter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: legacy-documenter
+    spec:
+      containers:
+        - name: app
+          # Podmień na swój rejestr (np. ACR: myregistry.azurecr.io/legacy-documenter:TAG)
+          image: legacy-documenter:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8501
+          envFrom:
+            - configMapRef:
+                name: legacy-documenter-config
+            - secretRef:
+                name: legacy-documenter-secrets
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 25
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: index-cache
+              mountPath: /app/.index_cache
+      volumes:
+        # Cache indeksu (indeks budowany raz, reindex po Merge PR). emptyDir = ulotny;
+        # do trwałości podmień na PVC.
+        - name: index-cache
+          emptyDir: {}

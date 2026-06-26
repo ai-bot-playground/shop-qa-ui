@@ -1,0 +1,27 @@
+# Szkielet Ingress. Podmień host i annotacje pod swój kontroler (nginx, Traefik,
+# AGIC na Azure). Dla Streamlit potrzebny WebSocket — większość kontrolerów ma
+# go domyślnie; przy nginx upewnij się co do timeoutów dla długich połączeń.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: legacy-documenter
+  namespace: legacy-documenter
+  annotations:
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    {}
+spec:
+  rules:
+    - host: legacy-documenter.example.com   # ← podmień
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: legacy-documenter
+                port:
+                  number: 80
+  # tls:
+  #   - hosts: [legacy-documenter.example.com]
+  #     secretName: legacy-documenter-tls

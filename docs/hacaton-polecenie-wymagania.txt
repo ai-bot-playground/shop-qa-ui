@@ -1,0 +1,38 @@
+Temat:
+Legacy Code Documenter & Tribal-Knowledge Q&A
+
+Problem:
+"Every mature organisation has at least one codebase that nobody fully understands anymore. The original authors have left; the comments are sparse or wrong; the function names are cryptic abbreviations from a 2014 refactor. When a new developer needs to change a billing calculation or trace why an order cancellation
+silently fails, they spend days reading code, asking colleagues, and making cautious guesses - because there is no reliable documentation.
+This “tribal knowledge” problem is not unique to small teams. Even well-maintained projects accumulate undocumented behaviour over time. The knowledge to answer most questions is in the code - it just cannot be queried in plain English, and it cannot cite its source the way a human expert could.
+
+Why it matters:
+- Maintenance risk: a developer who doesn’t understand a function is likely to break it when changing it - with no safety net from the code’s own logic.
+- Onboarding cost: it takes weeks, not hours, for a new engineer to become productive on an undocumented legacy service.
+- Audit and compliance: finance and operations teams regularly need to explain what a billing calculation does - and cannot get a citable answer without reading Python code."
+
+Wymagania:
+Rules of Play — Mandatory & Optional	
+Applies to every topic. Your pack repeats the topic-specific version of these.	
+	
+MANDATORY  —  required to qualify	
+MUST	Built with LLMs.
+MUST	Solves the assigned topic - you build the challenge your team claimed, not a different idea.
+MUST	If applicable, uses the provided sample data - at least as your starting point; you may extend it.
+MUST	Working demo - a live or recorded run showing the agent actually doing the task end to end.
+MUST	3-minute pitch — problem, what you built, demo, what you'd do next. 5 slide minimum.
+MUST	Responsible-AI check — name one risk (privacy, hallucination, bias) and how you mitigated it.
+OPTIONAL  —  bonus points	
+BONUS	Tool use / actions — the agent calls tools or takes a real action, not just chat.
+BONUS	Eval or test set — you measure quality (accuracy, pass-rate) rather than eyeballing it.
+BONUS	Multi-agent or sub-agents — orchestration where it genuinely helps.
+BONUS	Human-in-the-loop — a clean review/approve step before anything irreversible.
+BONUS	Polish — a usable UI, deployment, or a cost/latency note.
+BONUS	Extra data sources — you bring or generate additional realistic data.
+Judging - how points are awarded	
+Criterion	Weight
+Impact — does it solve the real problem?	30%
+Use of Claude / agentic design	25%
+Working demo & completeness	20%
+Creativity & 'wow'	15%
+Responsible AI & clarity of pitch	10%
