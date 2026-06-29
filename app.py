@@ -1,6 +1,7 @@
 import os
 import sys
 import uuid
+from collections import Counter
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -197,12 +198,23 @@ with st.sidebar:
             st.rerun()
 
     if st.session_state.get("chunks"):
-        st.success(f"✅ {len(st.session_state.chunks)} symboli")
+        chunks = st.session_state.chunks
+        repos_in_index = [r for r in st.session_state.get("repo_paths", {})]
+        per_repo = Counter(c.repo for c in chunks)
+        st.success(f"✅ {len(chunks)} symboli z {len(repos_in_index)} repo")
+        with st.expander(f"Rozkład: {len(repos_in_index)} repozytoriów"):
+            st.dataframe(
+                pd.DataFrame(
+                    [{"Repo": r, "Symboli": per_repo.get(r, 0)} for r in repos_in_index]
+                ),
+                use_container_width=True, hide_index=True,
+            )
         with st.expander("Zaindeksowane symbole"):
             st.dataframe(
                 pd.DataFrame([
-                    {"Symbol": c.symbol, "Plik": c.file_path, "Linie": f"{c.start_line}–{c.end_line}"}
-                    for c in st.session_state.chunks
+                    {"Repo": c.repo, "Symbol": c.symbol, "Plik": c.file_path,
+                     "Linie": f"{c.start_line}–{c.end_line}"}
+                    for c in chunks
                 ]),
                 use_container_width=True, hide_index=True,
             )
