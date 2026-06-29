@@ -1,0 +1,89 @@
+# manifest.yaml — deklaratywna mapa systemu: jakie aplikacje/funkcjonalności
+# tworzy workspace i z jakich repozytoriów się składają.
+#
+# shop-qa-ui czyta ten plik, by zbudować listę repozytoriów do indeksowania
+# (zamiast zgadywać po wzorcu nazwy `shop-*` i skanować dysk). Repozytoria
+# oznaczone `indexable: true` trafiają do selektora "Serwis sklepu" w UI.
+#
+# Ścieżki repo rozwijane są względem `workspace_root` (domyślnie katalog
+# nadrzędny shop-qa-ui). Nadpisywalne zmienną środowiskową SHOP_REPOS_DIR.
+
+version: 1
+
+# Katalog bazowy z repozytoriami, względem położenia tego pliku.
+workspace_root: ".."
+
+# Repozytorium wybrane domyślnie w UI.
+default_repo: shop-notification
+
+apps:
+  - id: shop
+    name: "Sklep flash-sale"
+    description: "E-commerce w architekturze mikroserwisowej: katalog, zamówienia (saga), magazyn, płatności, powiadomienia."
+    repos:
+      - name: shop-gateway
+        role: "API Gateway — publiczny punkt wejścia"
+        lang: java
+        indexable: true
+      - name: shop-catalog
+        role: "katalog produktów (read-heavy)"
+        lang: java
+        indexable: true
+      - name: shop-inventory
+        role: "magazyn i rezerwacje — serce współbieżności"
+        lang: java
+        indexable: true
+      - name: shop-order
+        role: "zamówienia — orkiestrator sagi"
+        lang: java
+        indexable: true
+      - name: shop-payment
+        role: "płatności (mock z odsetkiem odrzuceń)"
+        lang: java
+        indexable: true
+      - name: shop-notification
+        role: "powiadomienia (e-mail / SMS)"
+        lang: java
+        indexable: true
+      - name: shop-ui
+        role: "frontend (React)"
+        lang: js
+        indexable: true
+      - name: shop-infra
+        role: "dokumentacja, diagramy, docker-compose"
+        lang: none
+        indexable: false
+      - name: shop-kafka
+        role: "tematy Kafki + kontrakty zdarzeń"
+        lang: none
+        indexable: false
+      - name: shop-postgres
+        role: "init baz (database-per-service)"
+        lang: sql
+        indexable: false
+      - name: shop-redis
+        role: "config Redis (stock + rate limiting)"
+        lang: none
+        indexable: false
+
+  - id: qa-tooling
+    name: "Narzędzia QA / dev"
+    description: "Aplikacje wspierające development i jakość systemu sklepu."
+    repos:
+      - name: shop-qa-ui
+        role: "AI dev-frontend (ta aplikacja)"
+        lang: python
+        indexable: true
+      - name: shop-token-metrics
+        role: "metryki zużycia tokenów LLM"
+        lang: java
+        indexable: true
+
+  - id: tests
+    name: "Testy akceptacyjne"
+    description: "Testy e2e całego systemu."
+    repos:
+      - name: shop-acceptance-tests
+        role: "testy akceptacyjne (e2e)"
+        lang: java
+        indexable: true

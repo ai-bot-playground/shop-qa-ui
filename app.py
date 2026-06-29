@@ -115,31 +115,68 @@ def _advance():
         st.session_state.active_tab = STEP_KEYS[idx + 1]
         st.rerun()
 
+def _load_service_options():
+    """Czyta manifest.yaml i zwraca (opcje, domyślne_repo) dla selektora serwisu.
+
+    Opcje to lista {name, path, role} dla repozytoriów oznaczonych
+    `indexable: true`. Ścieżki rozwijane są względem `workspace_root` z manifestu
+    (nadpisywalne zmienną SHOP_REPOS_DIR). Gdy manifestu lub PyYAML brak —
+    łagodny fallback do skanu katalogów `shop-*` w katalogu nadrzędnym.
+    """
+    here = os.path.dirname(__file__)
+    env_root = os.environ.get("SHOP_REPOS_DIR")
+    manifest = None
+    try:
+        import yaml
+        with open(os.path.join(here, "manifest.yaml"), encoding="utf-8") as fh:
+            manifest = yaml.safe_load(fh) or {}
+    except Exception:
+        manifest = None
+
+    if manifest:
+        root = env_root or os.path.abspath(os.path.join(here, manifest.get("workspace_root", "..")))
+        options = [
+            {"name": r["name"], "path": os.path.join(root, r["name"]), "role": r.get("role", "")}
+            for app in manifest.get("apps", [])
+            for r in app.get("repos", [])
+            if r.get("indexable")
+        ]
+        return options, manifest.get("default_repo")
+
+    # Fallback — skan katalogów shop-* (gdy brak manifestu / PyYAML).
+    root = env_root or os.path.abspath(os.path.join(here, ".."))
+    options = []
+    if os.path.isdir(root):
+        options = [
+            {"name": d, "path": os.path.join(root, d), "role": ""}
+            for d in sorted(os.listdir(root))
+            if d.startswith("shop-") and os.path.isdir(os.path.join(root, d))
+        ]
+    return options, "shop-notification"
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🔍 Analizator Kodu")
     st.caption("Wiedza plemienna — odblokowana")
     st.divider()
 
-    # Indeksowanie — domyślnie celujemy w serwisy naszego sklepu
-    # (sibling repo ai-bot-playground; nadpisywalne przez SHOP_REPOS_DIR).
-    shop_dir = os.environ.get(
-        "SHOP_REPOS_DIR",
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ai-bot-playground")),
-    )
+    # Indeksowanie — lista repozytoriów pochodzi z manifest.yaml (deklaratywna
+    # mapa aplikacja → repo), zamiast zgadywać po wzorcu nazwy shop-*.
+    service_options, default_repo = _load_service_options()
     service_path = None
-    if os.path.isdir(shop_dir):
-        services = sorted(
-            d for d in os.listdir(shop_dir)
-            if d.startswith("shop-") and os.path.isdir(os.path.join(shop_dir, d))
+    if service_options:
+        names = [o["name"] for o in service_options]
+        labels = {
+            o["name"]: (f"{o['name']} — {o['role']}" if o["role"] else o["name"])
+            for o in service_options
+        }
+        default_idx = names.index(default_repo) if default_repo in names else 0
+        chosen = st.selectbox(
+            "Serwis sklepu", names, index=default_idx,
+            format_func=lambda n: labels.get(n, n),
+            help="Repozytoria z manifest.yaml (indexable: true)",
         )
-        if services:
-            default_idx = services.index("shop-notification") if "shop-notification" in services else 0
-            chosen = st.selectbox(
-                "Serwis sklepu", services, index=default_idx,
-                help=f"Katalogi shop-* w {shop_dir}",
-            )
-            service_path = os.path.join(shop_dir, chosen)
+        service_path = next(o["path"] for o in service_options if o["name"] == chosen)
 
     repo_path = st.text_input(
         "Ścieżka do repozytorium",
