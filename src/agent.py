@@ -20,7 +20,7 @@ _MODEL = "claude-opus-4-8"
 _OPENROUTER_ENDPOINT = os.environ.get(
     "OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1/chat/completions"
 )
-_OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
+_OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "z-ai/glm-5.2")
 
 # Tryb "thinking" (rozumowanie). Dla GLM-5.2 sterowany unified-paramem `reasoning`
 # OpenRoutera. Domyślnie effort=high ("max thinking"). Można nadpisać env-em:

@@ -593,6 +593,8 @@ elif active_tab == "analyze":
                                 st.session_state.sandbox_newfile = None
                                 st.session_state.sandbox_error = None
                                 st.session_state.sandbox_chunks = chunks_item
+                                st.session_state.sandbox_preload_chunks = chunks_item
+                                st.session_state.sandbox_multi_changes = None
                                 _advance()
 
 
@@ -619,20 +621,33 @@ elif active_tab == "sandbox":
                 st.warning(f"Nie znaleziono funkcji '{symbol}' w zaindeksowanym kodzie.")
             else:
                 # ── Ścieżka serwisu sklepu (Java/JS/TS/…): pełny plik → diff (git) → PR → bramka ──
-                # Wszystko poza .py (legacy sample) idzie tą ścieżką: Java, JSX/TSX front-endu itd.
+                # Obsługuje zarówno single-repo jak i multi-repo (wszystkie chunki z wyników wyszukiwania).
                 if not chunk.file_path.endswith(".py"):
-                    service = chunk.repo or os.path.basename(
-                        os.path.normpath(st.session_state.get("repo_paths", {}).get("", "") or "")
-                    )
-                    repo_path = st.session_state.get("repo_paths", {}).get(service, "")
-                    repo_slug = f"ai-bot-playground/{service}"
-                    target_rel = chunk.file_path
-                    target_abs = os.path.join(repo_path, target_rel) if repo_path else target_rel
-                    try:
-                        with open(target_abs, encoding="utf-8") as _f:
-                            original = _f.read()
-                    except OSError:
-                        original = chunk.source
+                    # Zbierz wszystkie unikalne (repo, plik) z preloaded chunks.
+                    preload_chunks = st.session_state.get("sandbox_preload_chunks") or [chunk]
+                    seen_keys: set = set()
+                    targets: list[dict] = []
+                    for c in preload_chunks:
+                        key = (c.repo, c.file_path)
+                        if key in seen_keys or c.file_path.endswith(".py"):
+                            continue
+                        seen_keys.add(key)
+                        svc = c.repo or os.path.basename(os.path.normpath(
+                            st.session_state.get("repo_paths", {}).get("", "") or ""
+                        ))
+                        rpath = st.session_state.get("repo_paths", {}).get(svc, "")
+                        tab = os.path.join(rpath, c.file_path) if rpath else c.file_path
+                        try:
+                            with open(tab, encoding="utf-8") as _f:
+                                orig = _f.read()
+                        except OSError:
+                            orig = c.source
+                        targets.append({
+                            "repo": svc,
+                            "file_path": c.file_path,
+                            "original": orig,
+                            "repo_path": rpath,
+                        })
 
                     if question:
                         st.markdown(
@@ -644,73 +659,125 @@ elif active_tab == "sandbox":
                         )
                     for p in accepted_proposals:
                         st.caption(f"✅ {p['title']} — {p['description']}")
-                    st.caption(f"Plik docelowy: `{target_rel}` · PR → **{repo_slug}** (base `main`)")
+                    n_repos = len({t["repo"] for t in targets})
+                    n_files = len(targets)
+                    st.caption(
+                        f"{n_files} {'plik' if n_files == 1 else 'pliki/plików'} "
+                        f"w {n_repos} {'repozytorium' if n_repos == 1 else 'repozytoriach'} · base `main`"
+                    )
 
-                    if st.session_state.get("sandbox_newfile") is None:
-                        with st.spinner("Agent generuje zmianę (pełna treść pliku)…"):
-                            try:
-                                st.session_state.sandbox_newfile = generate_file_change(
-                                    question, accepted_proposals, target_rel, original,
-                                )
-                                st.session_state.sandbox_error = None
-                            except Exception as exc:  # noqa: BLE001 — pokaż realny błąd w UI
-                                st.session_state.sandbox_newfile = ""
-                                st.session_state.sandbox_error = str(exc)
+                    # Inicjuj lub przywróć stan zmian per-plik.
+                    if st.session_state.get("sandbox_multi_changes") is None:
+                        st.session_state.sandbox_multi_changes = [
+                            {**t, "new_content": None, "diff": None, "error": None, "pr_result": None}
+                            for t in targets
+                        ]
+                    multi = st.session_state.sandbox_multi_changes
+
+                    # Generuj zmiany dla plików bez wygenerowanej treści.
+                    to_gen = [mc for mc in multi if mc["new_content"] is None]
+                    if to_gen:
+                        with st.spinner(f"Generuję zmiany dla {len(to_gen)}/{len(multi)} pliku/plików…"):
+                            for mc in to_gen:
+                                try:
+                                    mc["new_content"] = generate_file_change(
+                                        question, accepted_proposals,
+                                        mc["file_path"], mc["original"],
+                                    )
+                                    mc["diff"] = compute_diff(
+                                        mc["original"], mc["new_content"] or "", mc["file_path"]
+                                    )
+                                    mc["error"] = None
+                                except Exception as exc:
+                                    mc["new_content"] = ""
+                                    mc["diff"] = ""
+                                    mc["error"] = str(exc)
                         st.rerun()
 
-                    new_content = st.session_state.sandbox_newfile or ""
-                    sandbox_error = st.session_state.get("sandbox_error")
-                    if sandbox_error:
-                        st.error(
-                            f"Wywołanie LLM nie powiodło się: {sandbox_error}\n\n"
-                            "To nie jest brak klucza API. Jeśli to błąd certyfikatu "
-                            "(`CERTIFICATE_VERIFY_FAILED`), to przejściowy problem korporacyjnego "
-                            "proxy — ponów próbę."
-                        )
-                    elif not new_content.strip():
-                        if is_demo_mode():
-                            st.info(
-                                "Brak zmiany — tryb demo (bez `OPENROUTER_API_KEY`/`AZURE_ANTHROPIC_API_KEY`). "
-                                "Podłącz klucz API."
-                            )
-                        else:
-                            st.warning(
-                                "Model zwrócił pustą treść — najczęściej wskazany plik nie pasuje do "
-                                f"zmiany. Wybrano `{target_rel}` w serwisie **{service}**; jeśli chcesz "
-                                "zmienić inny serwis (np. shop-ui), zaindeksuj go w panelu bocznym i ponów."
-                            )
-                    else:
-                        diff_preview = compute_diff(original, new_content, target_rel)
-                        if not diff_preview.strip():
-                            st.warning("Wygenerowana treść jest identyczna z oryginałem (brak zmian).")
-                        else:
-                            st.markdown("**Podgląd zmian (diff liczony przez git):**")
-                            st.code(diff_preview, language="diff")
-                        with st.expander("Pełna nowa treść pliku"):
-                            st.code(new_content, language=_lang_for(target_rel))
-                        default_title = (
-                            accepted_proposals[0].get("commit_hint")
-                            if accepted_proposals else f"change: {service}"
-                        )
-                        pr_title = st.text_input("Tytuł PR / commit", value=default_title or f"change: {service}")
-                        can_pr = bool(diff_preview.strip())
-                        if st.button("🚀 Wystaw PR do serwisu", type="primary",
-                                     disabled=not can_pr, use_container_width=True):
-                            with st.spinner("Tworzę czystą gałąź (git worktree), zapisuję plik, wypycham i otwieram PR…"):
-                                res = open_pr_for_file_change(
-                                    target_rel, new_content, pr_title.strip() or f"change: {service}",
-                                    "PR wygenerowany przez shop-qa-ui. Walidacja: bramka preprod-gate.",
-                                    repo_slug, local_repo=repo_path,
-                                )
-                            if res.get("success"):
-                                st.session_state.sandbox_commit_done = res.get("branch", "branch")
-                                st.session_state.qa_repo_slug = repo_slug
-                                st.session_state.qa_pr_branch = res.get("branch", "")
-                                st.session_state.qa_pr_url = res.get("pr_url", "")
-                                st.session_state.qa_pr_warning = res.get("warning", "")
-                                _advance()
+                    # Pokaż diff per-plik.
+                    has_any_diff = any((mc.get("diff") or "").strip() for mc in multi)
+                    for mc in multi:
+                        diff_str = mc.get("diff") or ""
+                        label = f"`{mc['repo']}/{mc['file_path']}`"
+                        with st.expander(label, expanded=bool(diff_str.strip())):
+                            if mc.get("error"):
+                                st.error(f"Błąd LLM: {mc['error']}")
+                            elif not (mc.get("new_content") or "").strip():
+                                if is_demo_mode():
+                                    st.info("Tryb demo — podłącz klucz API, aby wygenerować zmianę.")
+                                else:
+                                    st.warning(
+                                        f"Model zwrócił pustą treść dla `{mc['file_path']}` "
+                                        f"(serwis **{mc['repo']}**)."
+                                    )
+                            elif not diff_str.strip():
+                                st.warning("Wygenerowana treść identyczna z oryginałem (brak zmian).")
                             else:
-                                st.error(f"Nie udało się wystawić PR: {res.get('error')}")
+                                st.code(diff_str, language="diff")
+                                with st.expander("Pełna nowa treść"):
+                                    st.code(mc["new_content"], language=_lang_for(mc["file_path"]))
+
+                    # Status PR per-repo (już wystawionych).
+                    done_prs = [mc for mc in multi if mc.get("pr_result") is not None]
+                    for mc in done_prs:
+                        pr = mc["pr_result"]
+                        if pr.get("success"):
+                            st.success(f"✅ PR otwarty — `{mc['repo']}`: {pr.get('pr_url', '')}")
+                        elif pr.get("warning"):
+                            st.warning(f"⚠️ `{mc['repo']}`: {pr['warning']}")
+                        else:
+                            st.error(f"❌ `{mc['repo']}`: {pr.get('error', 'nieznany błąd')}")
+
+                    # Przycisk wystawiania PRów dla pozostałych.
+                    pending = [
+                        mc for mc in multi
+                        if mc.get("pr_result") is None and (mc.get("diff") or "").strip()
+                    ]
+                    if pending and has_any_diff:
+                        default_title = (
+                            accepted_proposals[0].get("commit_hint") if accepted_proposals
+                            else f"change: {len(pending)} serwisów"
+                        )
+                        pr_title = st.text_input("Tytuł PR / commit", value=default_title or "change")
+                        n_p = len(pending)
+                        if st.button(
+                            f"🚀 Wystaw {'PR' if n_p == 1 else f'{n_p} PRy/PRów'} "
+                            f"({n_p} {'repozytorium' if n_p == 1 else 'repozytoria/repozytoriów'})",
+                            type="primary", use_container_width=True,
+                        ):
+                            with st.spinner(f"Wystawiam {n_p} PR-ów…"):
+                                for mc in pending:
+                                    rs = open_pr_for_file_change(
+                                        mc["file_path"], mc["new_content"],
+                                        pr_title.strip() or f"change: {mc['repo']}",
+                                        "PR wygenerowany przez shop-qa-ui. Walidacja: bramka preprod-gate.",
+                                        f"ai-bot-playground/{mc['repo']}",
+                                        local_repo=mc["repo_path"],
+                                    )
+                                    mc["pr_result"] = rs
+                            all_attempted = all(
+                                mc.get("pr_result") is not None
+                                for mc in multi if (mc.get("diff") or "").strip()
+                            )
+                            if all_attempted:
+                                st.session_state.sandbox_commit_done = "multi"
+                                st.session_state.qa_multi_prs = [
+                                    {
+                                        "repo": mc["repo"],
+                                        "repo_slug": f"ai-bot-playground/{mc['repo']}",
+                                        "pr_url": (mc.get("pr_result") or {}).get("pr_url", ""),
+                                        "branch": (mc.get("pr_result") or {}).get("branch", ""),
+                                        "success": (mc.get("pr_result") or {}).get("success", False),
+                                        "error": (mc.get("pr_result") or {}).get("error", ""),
+                                        "warning": (mc.get("pr_result") or {}).get("warning", ""),
+                                    }
+                                    for mc in multi if (mc.get("diff") or "").strip()
+                                ]
+                                _advance()
+                            st.rerun()
+                    elif not pending and done_prs:
+                        if st.button("Przejdź dalej → PR", type="primary"):
+                            _advance()
                     st.stop()
 
                 # ── Ścieżka Python (sample/legacy) ────────────────────────────
@@ -874,6 +941,28 @@ elif active_tab == "sandbox":
 # ═══════════════════════════════════════════════════════════════════════════════
 elif active_tab == "pr":
     st.title("Pull Request")
+
+    # ── Ścieżka multi-repo (wiele PRów cross-repo) ──
+    if st.session_state.get("qa_multi_prs"):
+        multi_prs = st.session_state.qa_multi_prs
+        successful = [pr for pr in multi_prs if pr["success"]]
+        n_repos = len({pr["repo"] for pr in multi_prs})
+        st.markdown(f"### {len(multi_prs)} Pull Requestów w {n_repos} repozytoriach")
+        st.markdown(f"**{len(successful)}/{len(multi_prs)}** otwartych pomyślnie.")
+        for pr in multi_prs:
+            icon = "✅" if pr["success"] else ("⚠️" if pr.get("warning") else "❌")
+            with st.expander(f"{icon} `{pr['repo_slug']}`", expanded=not pr["success"]):
+                if pr["success"]:
+                    st.success(f"PR otwarty: {pr['pr_url']}")
+                    if pr["pr_url"]:
+                        st.link_button("Otwórz PR na GitHub", pr["pr_url"], use_container_width=True)
+                    st.caption(f"Gałąź: `{pr['branch']}` · wymagany check **preprod-gate**")
+                elif pr.get("warning"):
+                    st.warning(pr["warning"])
+                    st.caption(f"Gałąź: `{pr['branch']}`")
+                else:
+                    st.error(f"Błąd: {pr['error']}")
+        st.stop()
 
     # ── Ścieżka Java (serwis sklepu): PR + status bramki preprod + merge ──
     if st.session_state.get("qa_repo_slug"):
