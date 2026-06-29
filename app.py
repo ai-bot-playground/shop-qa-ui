@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import streamlit as st
 import pandas as pd
-from src.ingest import ingest_repo
+from src.ingest import ingest_repo, ingest_app
 from src.agent import (
     run_qa, generate_code_fix, fix_code_with_tests, generate_change_diff,
     generate_file_change, is_demo_mode,
@@ -115,13 +115,13 @@ def _advance():
         st.session_state.active_tab = STEP_KEYS[idx + 1]
         st.rerun()
 
-def _load_service_options():
-    """Czyta manifest.yaml i zwraca (opcje, domyślne_repo) dla selektora serwisu.
+def _load_app_options():
+    """Czyta manifest.yaml i zwraca (lista_aplikacji, domyślne_id_app).
 
-    Opcje to lista {name, path, role} dla repozytoriów oznaczonych
-    `indexable: true`. Ścieżki rozwijane są względem `workspace_root` z manifestu
-    (nadpisywalne zmienną SHOP_REPOS_DIR). Gdy manifestu lub PyYAML brak —
-    łagodny fallback do skanu katalogów `shop-*` w katalogu nadrzędnym.
+    Każda aplikacja to dict {id, name, repos: [{name, path}]} gdzie repos
+    zawiera tylko repozytoria `indexable: true` z istniejącym katalogiem.
+    Ścieżki rozwijane względem `workspace_root` z manifestu (nadpisywalne
+    SHOP_REPOS_DIR). Fallback: jedna syntetyczna aplikacja z repo shop-*.
     """
     here = os.path.dirname(__file__)
     env_root = os.environ.get("SHOP_REPOS_DIR")
@@ -135,24 +135,29 @@ def _load_service_options():
 
     if manifest:
         root = env_root or os.path.abspath(os.path.join(here, manifest.get("workspace_root", "..")))
-        options = [
-            {"name": r["name"], "path": os.path.join(root, r["name"]), "role": r.get("role", "")}
-            for app in manifest.get("apps", [])
-            for r in app.get("repos", [])
-            if r.get("indexable")
-        ]
-        return options, manifest.get("default_repo")
+        apps = []
+        for app in manifest.get("apps", []):
+            repos = [
+                {"name": r["name"], "path": os.path.join(root, r["name"])}
+                for r in app.get("repos", [])
+                if r.get("indexable") and os.path.isdir(os.path.join(root, r["name"]))
+            ]
+            if repos:
+                apps.append({"id": app["id"], "name": app["name"], "repos": repos})
+        default_id = apps[0]["id"] if apps else None
+        return apps, default_id
 
-    # Fallback — skan katalogów shop-* (gdy brak manifestu / PyYAML).
+    # Fallback — jedna aplikacja ze skanem shop-* (gdy brak manifestu / PyYAML).
     root = env_root or os.path.abspath(os.path.join(here, ".."))
-    options = []
+    repos = []
     if os.path.isdir(root):
-        options = [
-            {"name": d, "path": os.path.join(root, d), "role": ""}
+        repos = [
+            {"name": d, "path": os.path.join(root, d)}
             for d in sorted(os.listdir(root))
             if d.startswith("shop-") and os.path.isdir(os.path.join(root, d))
         ]
-    return options, "shop-notification"
+    apps = [{"id": "shop", "name": "Sklep (fallback)", "repos": repos}] if repos else []
+    return apps, (apps[0]["id"] if apps else None)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -160,40 +165,33 @@ with st.sidebar:
     st.caption("Wiedza plemienna — odblokowana")
     st.divider()
 
-    # Indeksowanie — lista repozytoriów pochodzi z manifest.yaml (deklaratywna
-    # mapa aplikacja → repo), zamiast zgadywać po wzorcu nazwy shop-*.
-    service_options, default_repo = _load_service_options()
-    service_path = None
-    if service_options:
-        names = [o["name"] for o in service_options]
-        labels = {
-            o["name"]: (f"{o['name']} — {o['role']}" if o["role"] else o["name"])
-            for o in service_options
-        }
-        default_idx = names.index(default_repo) if default_repo in names else 0
-        chosen = st.selectbox(
-            "Serwis sklepu", names, index=default_idx,
-            format_func=lambda n: labels.get(n, n),
-            help="Repozytoria z manifest.yaml (indexable: true)",
+    # Indeksowanie — selektor aplikacji z manifest.yaml. Wybranie aplikacji
+    # indeksuje WSZYSTKIE jej repozytoria naraz; użytkownik nie musi wiedzieć,
+    # w którym repo leży kod.
+    app_options, default_app_id = _load_app_options()
+    chosen_app = None
+    if app_options:
+        app_ids = [a["id"] for a in app_options]
+        default_idx = app_ids.index(default_app_id) if default_app_id in app_ids else 0
+        chosen_app_id = st.selectbox(
+            "Aplikacja", app_ids, index=default_idx,
+            format_func=lambda aid: next((a["name"] for a in app_options if a["id"] == aid), aid),
+            help="Indeksuje wszystkie repozytoria aplikacji (z manifest.yaml)",
         )
-        service_path = next(o["path"] for o in service_options if o["name"] == chosen)
+        chosen_app = next((a for a in app_options if a["id"] == chosen_app_id), None)
+        if chosen_app:
+            repo_names = [r["name"] for r in chosen_app["repos"]]
+            st.caption(f"{len(repo_names)} repo: {', '.join(repo_names)}")
 
-    repo_path = st.text_input(
-        "Ścieżka do repozytorium",
-        value=os.environ.get(
-            "REPO_PATH",
-            service_path or os.path.join(os.path.dirname(__file__), "sample"),
-        ),
-        help="Ścieżka do katalogu z kodem (nadpisuje wybór serwisu powyżej)",
-    )
-    if st.button("⚡ Indeksuj repozytorium", use_container_width=True):
-        if not os.path.isdir(repo_path):
-            st.error(f"Katalog nie istnieje: {repo_path}")
+    if st.button("⚡ Indeksuj aplikację", use_container_width=True):
+        repos_to_index = chosen_app["repos"] if chosen_app else []
+        if not repos_to_index:
+            st.error("Brak repozytoriów do zaindeksowania — sprawdź manifest.yaml.")
         else:
-            with st.spinner("Indeksowanie…"):
-                chunks = ingest_repo(repo_path)
+            with st.spinner(f"Indeksowanie {len(repos_to_index)} repozytoriów…"):
+                chunks = ingest_app(repos_to_index)
             st.session_state.chunks = chunks
-            st.session_state.repo_path = repo_path
+            st.session_state.repo_paths = {r["name"]: r["path"] for r in repos_to_index}
             if st.session_state.active_tab == "ready":
                 st.session_state.active_tab = "analyze"
             st.rerun()
@@ -432,7 +430,7 @@ elif active_tab == "analyze":
 
         if ask_clicked and question.strip():
             with st.spinner("Szukam…"):
-                result = run_qa(question, st.session_state.repo_path)
+                result = run_qa(question, chunks=st.session_state.chunks)
             _active_session()["messages"].insert(0, {
                 "question": question,
                 "answer": result["answer"],
@@ -514,11 +512,11 @@ elif active_tab == "analyze":
                     if chunks_item and ("file_path" in tech_visible or "source_code" in tech_visible):
                         with st.expander("📎 Źródła"):
                             for c in chunks_item:
-                                abs_path = os.path.join(
-                                    st.session_state.get("repo_path", ""), c.file_path
-                                )
+                                repo_root = st.session_state.get("repo_paths", {}).get(c.repo, "")
+                                display_path = f"{c.repo}/{c.file_path}" if c.repo else c.file_path
+                                abs_path = os.path.join(repo_root, c.file_path) if repo_root else display_path
                                 if "file_path" in tech_visible:
-                                    st.code(f"{abs_path}:{c.start_line}", language=None)
+                                    st.code(f"{display_path}:{c.start_line}", language=None)
                                 if "source_code" in tech_visible:
                                     lang = _lang_for(c.file_path)
                                     st.code(
@@ -611,11 +609,13 @@ elif active_tab == "sandbox":
                 # ── Ścieżka serwisu sklepu (Java/JS/TS/…): pełny plik → diff (git) → PR → bramka ──
                 # Wszystko poza .py (legacy sample) idzie tą ścieżką: Java, JSX/TSX front-endu itd.
                 if not chunk.file_path.endswith(".py"):
-                    repo_path = st.session_state.get("repo_path", "")
-                    service = os.path.basename(os.path.normpath(repo_path))
+                    service = chunk.repo or os.path.basename(
+                        os.path.normpath(st.session_state.get("repo_paths", {}).get("", "") or "")
+                    )
+                    repo_path = st.session_state.get("repo_paths", {}).get(service, "")
                     repo_slug = f"ai-bot-playground/{service}"
                     target_rel = chunk.file_path
-                    target_abs = os.path.join(repo_path, target_rel)
+                    target_abs = os.path.join(repo_path, target_rel) if repo_path else target_rel
                     try:
                         with open(target_abs, encoding="utf-8") as _f:
                             original = _f.read()
@@ -834,7 +834,9 @@ elif active_tab == "sandbox":
                         )
                         if commit_clicked and commit_msg.strip():
                             edited = st.session_state.get("sandbox_edited_code", chunk.source)
-                            repo_path = st.session_state.get("repo_path", "")
+                            repo_path = st.session_state.get("repo_paths", {}).get(
+                                chunk.repo, st.session_state.get("repo_path", "")
+                            )
                             with st.spinner("Zapisuję zmianę, commituję i wypycham branch…"):
                                 abs_path = replace_function_in_file(chunk, edited, repo_path)
                                 res = commit_and_push_change(abs_path, commit_msg.strip(), repo_path)

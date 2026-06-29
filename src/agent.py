@@ -5,7 +5,7 @@ import re
 import requests
 from dotenv import load_dotenv
 
-from .ingest import ingest_repo, CodeChunk
+from .ingest import ingest_repo, ingest_app, CodeChunk
 from .retriever import keyword_search
 
 load_dotenv()
@@ -182,10 +182,10 @@ def _extract_json(text: str) -> dict:
 
 
 def _build_context(chunks: list[CodeChunk]) -> str:
-    return "\n\n".join(
-        f"# PLIK: {c.file_path} | FUNKCJA: {c.symbol} | LINIE: {c.start_line}–{c.end_line}\n{c.source}"
-        for c in chunks
-    )
+    def _header(c: CodeChunk) -> str:
+        loc = f"{c.repo}/{c.file_path}" if c.repo else c.file_path
+        return f"# REPO/PLIK: {loc} | FUNKCJA: {c.symbol} | LINIE: {c.start_line}–{c.end_line}"
+    return "\n\n".join(f"{_header(c)}\n{c.source}" for c in chunks)
 
 
 _TECH_SYSTEM = """\
@@ -375,8 +375,14 @@ def generate_file_change(question: str, proposals: list[dict],
     return _strip_fences(_call(_FILECHANGE_SYSTEM, user_msg, max_tokens=4096))
 
 
-def run_qa(question: str, repo_path: str, **_kwargs) -> dict:
-    all_chunks = ingest_repo(repo_path)
+def run_qa(question: str, repo_path: str = "", chunks: list[CodeChunk] | None = None, **_kwargs) -> dict:
+    """Odpowiada na pytanie o kod.
+
+    Gdy `chunks` jest podany (pre-indexed, np. z ingest_app dla wielu repo),
+    używa go bezpośrednio. W przeciwnym razie indeksuje `repo_path` (compat
+    z run_qa_eval w sandbox.py i starym flow).
+    """
+    all_chunks = chunks if chunks is not None else ingest_repo(repo_path)
     relevant_chunks = keyword_search(all_chunks, question, top_k=5)
 
     if not relevant_chunks:
