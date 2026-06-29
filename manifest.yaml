@@ -65,10 +65,14 @@ apps:
         role: "config Redis (stock + rate limiting)"
         lang: none
         indexable: false
+      - name: shop-acceptance-tests
+        role: "testy akceptacyjne e2e"
+        lang: java
+        indexable: true
 
   - id: qa-tooling
     name: "Narzędzia QA / dev"
-    description: "Aplikacje wspierające development i jakość systemu sklepu."
+    description: "Ta aplikacja (shop-qa-ui) i metryki tokenów — meta-warstwa nad sklepem."
     repos:
       - name: shop-qa-ui
         role: "AI dev-frontend (ta aplikacja)"
@@ -76,14 +80,5 @@ apps:
         indexable: true
       - name: shop-token-metrics
         role: "metryki zużycia tokenów LLM"
-        lang: java
-        indexable: true
-
-  - id: tests
-    name: "Testy akceptacyjne"
-    description: "Testy e2e całego systemu."
-    repos:
-      - name: shop-acceptance-tests
-        role: "testy akceptacyjne (e2e)"
         lang: java
         indexable: true
