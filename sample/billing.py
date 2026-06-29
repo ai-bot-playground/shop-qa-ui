@@ -4,6 +4,7 @@ TAX_RATE = 0.23   # VAT PL
 
 
 # [demo] Podłącz klucz API, aby wygenerować realną poprawkę.
+# [demo] Podłącz klucz API, aby wygenerować realną poprawkę.
 def calculate_total(subtotal, discount_code=None):
     CODES = {
         "PROMO30": 0.30,
