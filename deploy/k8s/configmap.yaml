@@ -6,12 +6,11 @@ metadata:
   name: legacy-documenter-config
   namespace: legacy-documenter
 data:
-  LLM_PROVIDER: "azure"
-  # Model MOCNY (aktywny) — Opus 4.8, analiza/Q&A
-  AZURE_AI_ENDPOINT: "https://ai-remik.services.ai.azure.com/anthropic"
-  AZURE_AI_DEPLOYMENT: "claude-opus-4-8"
-  # Model MAŁY (placeholder w configu — kod jeszcze nie używa) — GPT-5.4-mini
-  AZURE_AI_DEPLOYMENT_FAST: "gpt-5.4-mini"
+  # OpenRouter (OpenAI-compatible) — aktywna ścieżka LLM. Klucz API → secret
+  # (OPENROUTER_API_KEY). src/agent.py: dyspozytor OpenRouter → mock.
+  OPENROUTER_MODEL: "z-ai/glm-5.2"
+  OPENROUTER_REASONING_EFFORT: "high"
+  OPENROUTER_MAX_TOKENS: "32000"
   # Repo docelowe (docelowo legacy-satchmo, gdy będzie zapis wyników analizy)
   REPO_PATH: "sample/order_service"
   STREAMLIT_PORT: "8501"

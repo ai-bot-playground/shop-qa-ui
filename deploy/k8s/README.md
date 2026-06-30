@@ -27,8 +27,7 @@ podman push myregistry.azurecr.io/legacy-documenter:1.0.0
 kubectl create namespace legacy-documenter
 kubectl create secret generic legacy-documenter-secrets \
   --namespace legacy-documenter \
-  --from-literal=AZURE_ANTHROPIC_API_KEY=... \
-  --from-literal=AZURE_OPENAI_API_KEY=...
+  --from-literal=OPENROUTER_API_KEY=sk-or-...
 
 # 3. Reszta zasobów
 kubectl apply -k deploy/k8s
