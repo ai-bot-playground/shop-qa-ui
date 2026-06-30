@@ -5,7 +5,7 @@ import re
 import requests
 from dotenv import load_dotenv
 
-from .ingest import ingest_repo, CodeChunk
+from .ingest import ingest_repo, ingest_app, CodeChunk
 from .retriever import keyword_search
 
 load_dotenv()
@@ -20,7 +20,7 @@ _MODEL = "claude-opus-4-8"
 _OPENROUTER_ENDPOINT = os.environ.get(
     "OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1/chat/completions"
 )
-_OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
+_OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "z-ai/glm-5.2")
 
 # Tryb "thinking" (rozumowanie). Dla GLM-5.2 sterowany unified-paramem `reasoning`
 # OpenRoutera. Domyślnie effort=high ("max thinking"). Można nadpisać env-em:
@@ -152,7 +152,9 @@ def _call_openrouter(system: str, user_content: str, max_tokens: int) -> str:
     resp.raise_for_status()
     data = resp.json()
     _emit_token_metrics(_OPENROUTER_MODEL, data.get("usage") or {})
-    content = data["choices"][0]["message"].get("content", "")
+    # GLM-5.2 bywa zwraca content=null (gdy całość budżetu poszła w reasoning lub
+    # odpowiedź była pusta). `or ""` chroni dalszy _strip_* przed AttributeError.
+    content = data["choices"][0]["message"].get("content") or ""
     return _strip_think(content)
 
 
@@ -182,10 +184,10 @@ def _extract_json(text: str) -> dict:
 
 
 def _build_context(chunks: list[CodeChunk]) -> str:
-    return "\n\n".join(
-        f"# PLIK: {c.file_path} | FUNKCJA: {c.symbol} | LINIE: {c.start_line}–{c.end_line}\n{c.source}"
-        for c in chunks
-    )
+    def _header(c: CodeChunk) -> str:
+        loc = f"{c.repo}/{c.file_path}" if c.repo else c.file_path
+        return f"# REPO/PLIK: {loc} | FUNKCJA: {c.symbol} | LINIE: {c.start_line}–{c.end_line}"
+    return "\n\n".join(f"{_header(c)}\n{c.source}" for c in chunks)
 
 
 _TECH_SYSTEM = """\
@@ -231,13 +233,17 @@ Odpowiedz WYŁĄCZNIE prawidłowym JSON (bez markdown, bez wyjaśnień):
       "risk": "Bardzo niski|Niski|Średni|Wysoki",
       "commit_hint": "<sugestia git commit, np. fix: ...>"
     }
-  ]
+  ],
+  "recommended_index": <0-based indeks JEDNEJ propozycji, którą sam wybierasz jako najbardziej optymalną>,
+  "recommended_reason": "<1 zdanie: dlaczego TA propozycja jest najlepsza — najlepszy stosunek wartości do nakładu/ryzyka i zgodność z dobrymi praktykami>"
 }
 
 Zasady:
 - "feasibility.verdict" oceniaj realnie wobec naszej architektury (saga, Kafka, bramka preprod).
 - "test_plan" odwołuj się do naszych testów (per-serwis Cucumber + shop-acceptance-tests).
-- Wygeneruj dokładnie 3 propozycje. Odpowiadaj po polsku.\
+- Wygeneruj dokładnie 3 propozycje. Odpowiadaj po polsku.
+- "recommended_index" MUSI wskazywać tę jedną propozycję, którą rekomendujesz wdrożyć — wybierasz
+  ją Ty (najbardziej zasadną, zgodną z dobrymi praktykami inżynierskimi), użytkownik nie wybiera.\
 """
 
 
@@ -280,7 +286,72 @@ Zasady:
 1. Zwróć WYŁĄCZNIE pełną, zaktualizowaną treść TEGO pliku — bez wyjaśnień, bez markdown, bez ```.
 2. Zachowaj wszystko bez zmian poza żądaną modyfikacją (importy, formatowanie, resztę kodu).
 3. Kod musi pozostać kompilowalny i zgodny ze stylem/konwencjami projektu (Java/Spring).
-4. Jeśli zmiany nie da się bezpiecznie wykonać w tym pliku — zwróć pustą odpowiedź.\
+4. Jeśli ten plik NIE jest związany z żądaną zmianą albo zmiany nie da się w nim bezpiecznie
+   wykonać — odpowiedz DOKŁADNIE jednym słowem: BRAK_ZMIAN (bez cudzysłowów, bez nic więcej).
+   NIE zwracaj pustego pliku ani opisu — sam token BRAK_ZMIAN.\
+"""
+
+# Sentinel + echo-frazy oznaczające „ten plik nie jest celem zmiany". Model bywa
+# zwraca to jako treść pliku zamiast faktycznie odmówić — wykrywamy i mapujemy na "".
+_NO_CHANGE_SENTINEL = "brak_zmian"
+_NO_CHANGE_PHRASES = (
+    "brak_zmian", "brakzmian", "zwrocpustaodpowiedz", "zwróćpustąodpowiedź",
+    "pustaodpowiedz", "pustąodpowiedź", "nochange", "brakzmiany",
+)
+
+
+def _is_no_change(text: str) -> bool:
+    """True gdy odpowiedź modelu to faktycznie „nie zmieniam tego pliku" (pustka,
+    sentinel BRAK_ZMIAN albo echo instrukcji), a nie realna treść pliku."""
+    if not text or not text.strip():
+        return True
+    norm = re.sub(r"[^\w]", "", text.strip().lower())
+    # Krótka odpowiedź bez cech kodu, pasująca do sentinela/echa → brak zmiany.
+    if len(norm) <= 40 and any(p in norm for p in _NO_CHANGE_PHRASES):
+        return True
+    return False
+
+
+_PLAN_SYSTEM = """\
+Jesteś architektem systemu opisanego w KONTEKST SYSTEMU. Dostajesz MAPĘ REPOZYTORIÓW
+(istniejące pliki i symbole każdego serwisu) oraz żądaną zmianę biznesową.
+
+Twoje zadanie: zaplanuj KTÓRE pliki trzeba zmienić i JAKIE nowe utworzyć, aby zrealizować
+zmianę w całym systemie (frontend + gateway + serwisy). Myśl warstwami: UI, propagacja przez
+gateway, logika w serwisie, kontrakt/dane.
+
+Odpowiedz WYŁĄCZNIE prawidłowym JSON (bez markdown, bez wyjaśnień):
+{
+  "files": [
+    {
+      "repo": "<nazwa repo z MAPY, np. shop-catalog>",
+      "path": "<ścieżka pliku względem korzenia repo>",
+      "action": "modify|create",
+      "reason": "<po co ten plik — 1 zdanie po polsku>"
+    }
+  ]
+}
+
+Zasady:
+- Używaj WYŁĄCZNIE repozytoriów występujących w MAPIE REPOZYTORIÓW.
+- "modify" dla istniejących plików (muszą być w MAPIE), "create" dla nowych (ścieżka zgodna z
+  konwencją pakietu/katalogu danego serwisu).
+- Uwzględnij WSZYSTKIE warstwy potrzebne do działania zmienia (np. komponent UI + filtr w
+  gateway + logika w serwisie). Nie pomijaj frontendu, jeśli zmiana go dotyczy.
+- Plan minimalny ale KOMPLETNY. Nie dodawaj plików nieistotnych dla zmiany.
+- Odpowiadaj po polsku w polu reason.\
+"""
+
+_NEWFILE_SYSTEM = """\
+Jesteś senior developerem systemu opisanego w KONTEKST SYSTEMU. Tworzysz NOWY plik od zera.
+
+Zasady:
+1. Zwróć WYŁĄCZNIE pełną treść nowego pliku — bez wyjaśnień, bez markdown, bez ```.
+2. Kod kompilowalny i zgodny ze stylem/konwencjami warstwy (Java/Spring dla serwisów,
+   React/Vite/JSX dla shop-ui).
+3. Plik ma realizować swoją część żądanej zmiany (zgodnie z jego ścieżką/warstwą).
+4. Jeśli tego pliku nie da się sensownie utworzyć dla tej zmiany — odpowiedz DOKŁADNIE jednym
+   słowem: BRAK_ZMIAN.\
 """
 
 
@@ -372,11 +443,93 @@ def generate_file_change(question: str, proposals: list[dict],
     # W trybie demo (brak klucza) _mock_call zwraca "" bez wyjątku. Realne błędy
     # (np. TLS/serwer) NIE są maskowane jako pustka — propagujemy je, by UI mógł
     # pokazać prawdziwą przyczynę zamiast mylącego "brak klucza API".
-    return _strip_fences(_call(_FILECHANGE_SYSTEM, user_msg, max_tokens=4096))
+    result = _strip_fences(_call(_FILECHANGE_SYSTEM, user_msg, max_tokens=4096))
+    # Sentinel/echo „BRAK_ZMIAN" → traktuj jako brak zmiany (nie wstawiaj tego
+    # zdania jako treści pliku, co dawało diff kasujący cały plik).
+    return "" if _is_no_change(result) else result
 
 
-def run_qa(question: str, repo_path: str, **_kwargs) -> dict:
-    all_chunks = ingest_repo(repo_path)
+def build_repo_map(chunks: list[CodeChunk]) -> str:
+    """Zwięzła mapa: per repo lista plików i ich symboli — wejście dla plannera.
+
+    Buduje hierarchię repo → plik → [symbole] z zaindeksowanych chunków, by LLM
+    rozumował o strukturze całej aplikacji zamiast polegać na top-5 z retrievalu.
+    """
+    by_repo: dict[str, dict[str, list[str]]] = {}
+    for c in chunks:
+        repo = c.repo or "(root)"
+        by_repo.setdefault(repo, {}).setdefault(c.file_path, []).append(c.symbol)
+    lines: list[str] = []
+    for repo in sorted(by_repo):
+        lines.append(f"## {repo}")
+        for path in sorted(by_repo[repo]):
+            syms = ", ".join(by_repo[repo][path][:8])
+            lines.append(f"- {path}  [{syms}]")
+    return "\n".join(lines)
+
+
+def plan_change(question: str, repo_map: str, proposals: list[dict]) -> list[dict]:
+    """LLM planuje pliki do zmiany/utworzenia w całej aplikacji (zamiast top-5 retrievalu).
+
+    Zwraca listę {repo, path, action: modify|create, reason}. Pusta lista przy błędzie
+    lub w trybie demo.
+    """
+    props = "\n".join(
+        f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or [])
+    )
+    user_msg = (
+        f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
+        f"MAPA REPOZYTORIÓW (istniejące pliki i symbole):\n{repo_map}\n\n"
+        f"ŻĄDANA ZMIANA: {question}\n"
+        f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
+        f"Zwróć plan zmian jako JSON:"
+    )
+    try:
+        raw = _call(_PLAN_SYSTEM, user_msg, max_tokens=2048)
+        data = _extract_json(raw)
+    except Exception:
+        return []
+    out: list[dict] = []
+    seen: set = set()
+    for f in (data.get("files") or []):
+        repo = (f.get("repo") or "").strip()
+        path = (f.get("path") or "").strip().lstrip("/")
+        action = (f.get("action") or "modify").strip().lower()
+        if not repo or not path or (repo, path) in seen:
+            continue
+        seen.add((repo, path))
+        out.append({
+            "repo": repo, "path": path,
+            "action": "create" if action == "create" else "modify",
+            "reason": (f.get("reason") or "").strip(),
+        })
+    return out
+
+
+def generate_new_file(question: str, proposals: list[dict], repo: str, file_path: str) -> str:
+    """Pełna treść NOWEGO pliku (action=create z planu). "" gdy nie da się utworzyć/demo."""
+    props = "\n".join(
+        f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or [])
+    )
+    user_msg = (
+        f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
+        f"NOWY PLIK DO UTWORZENIA: {repo}/{file_path}\n\n"
+        f"ŻĄDANA ZMIANA: {question}\n"
+        f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
+        f"Zwróć pełną treść nowego pliku:"
+    )
+    result = _strip_fences(_call(_NEWFILE_SYSTEM, user_msg, max_tokens=4096))
+    return "" if _is_no_change(result) else result
+
+
+def run_qa(question: str, repo_path: str = "", chunks: list[CodeChunk] | None = None, **_kwargs) -> dict:
+    """Odpowiada na pytanie o kod.
+
+    Gdy `chunks` jest podany (pre-indexed, np. z ingest_app dla wielu repo),
+    używa go bezpośrednio. W przeciwnym razie indeksuje `repo_path` (compat
+    z run_qa_eval w sandbox.py i starym flow).
+    """
+    all_chunks = chunks if chunks is not None else ingest_repo(repo_path)
     relevant_chunks = keyword_search(all_chunks, question, top_k=5)
 
     if not relevant_chunks:
@@ -403,6 +556,8 @@ def run_qa(question: str, repo_path: str, **_kwargs) -> dict:
     feasibility: dict | None = None
     test_plan: dict | None = None
     proposals: list[dict] = []
+    recommended_index: int | None = None
+    recommended_reason: str | None = None
     try:
         biz_raw = _call(_BIZ_SYSTEM, user_msg, max_tokens=2560)
         biz_data = _extract_json(biz_raw)
@@ -410,6 +565,8 @@ def run_qa(question: str, repo_path: str, **_kwargs) -> dict:
         feasibility = biz_data.get("feasibility")
         test_plan = biz_data.get("test_plan")
         proposals = biz_data.get("proposals", [])
+        recommended_index = biz_data.get("recommended_index")
+        recommended_reason = biz_data.get("recommended_reason")
     except Exception:
         pass  # brak kontekstu biznesowego nie blokuje odpowiedzi technicznej
 
@@ -420,6 +577,8 @@ def run_qa(question: str, repo_path: str, **_kwargs) -> dict:
         "feasibility": feasibility,
         "test_plan": test_plan,
         "proposals": proposals,
+        "recommended_index": recommended_index,
+        "recommended_reason": recommended_reason,
     }
 
 
@@ -522,6 +681,11 @@ def _mock_biz_json(user_content: str) -> str:
                 "commit_hint": f"test: dodaj testy brzegowe dla {symbol}",
             },
         ],
+        "recommended_index": 0,
+        "recommended_reason": (
+            "[DEMO] Wydzielenie parametrów daje najlepszy stosunek wartości do "
+            "nakładu i ryzyka — usuwa zaszyte wartości bez zmiany logiki."
+        ),
     }
     return json.dumps(data, ensure_ascii=False)
 
@@ -545,6 +709,8 @@ def _mock_call(system: str, user_content: str, max_tokens: int = 1024) -> str:
         return _mock_biz_json(user_content)
     if system in (_FIX_SYSTEM, _FIX_TESTS_SYSTEM):
         return _mock_fix_code(user_content)
-    if system in (_DIFF_SYSTEM, _FILECHANGE_SYSTEM):
+    if system in (_DIFF_SYSTEM, _FILECHANGE_SYSTEM, _NEWFILE_SYSTEM):
         return ""  # tryb demo: realna zmiana wymaga podłączonego modelu
+    if system is _PLAN_SYSTEM:
+        return "{}"  # tryb demo: brak planu
     return _mock_tech_answer(user_content)
