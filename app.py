@@ -12,6 +12,7 @@ from src.ingest import ingest_repo, ingest_app
 from src.agent import (
     run_qa, generate_code_fix, fix_code_with_tests, generate_change_diff,
     generate_file_change, is_demo_mode, plan_change, build_repo_map, generate_new_file,
+    verify_completeness,
 )
 from src.sandbox import (
     run_static_tests, replace_function_in_file, git_commit_file, commit_and_push_change,
@@ -784,6 +785,7 @@ elif active_tab == "sandbox":
                             for t in targets
                         ]
                         st.session_state.sandbox_test_results = {}  # nowe zmiany → testy nieaktualne
+                        st.session_state.sandbox_verify = None       # i weryfikacja nieaktualna
                     multi = st.session_state.sandbox_multi_changes
 
                     # Generuj zmiany dla plików bez wygenerowanej treści.
@@ -840,6 +842,95 @@ elif active_tab == "sandbox":
                                 st.code(diff_str, language="diff")
                                 with st.expander("Pełna nowa treść"):
                                     st.code(mc["new_content"], language=_lang_for(mc["file_path"]))
+
+                    # ── Kompletność: licznik + ponów puste + agent-recenzent ──
+                    produced = [mc for mc in multi if (mc.get("new_content") or "").strip()]
+                    empty = [
+                        mc for mc in multi
+                        if not (mc.get("new_content") or "").strip() and not mc.get("error")
+                    ]
+                    st.markdown("---")
+                    st.caption(
+                        f"Wygenerowano treść: **{len(produced)}/{len(multi)}** plików"
+                        + (f" · **{len(empty)}** pustych (model nie wygenerował)" if empty else "")
+                    )
+                    if empty:
+                        st.warning(
+                            "Część zaplanowanych plików wróciła pusta — model uznał je za nieistotne "
+                            "albo nie poradził sobie z treścią. Możesz ponowić ich generowanie."
+                        )
+                        if st.button("♻️ Ponów generowanie pustych", use_container_width=True):
+                            for mc in empty:
+                                mc["new_content"] = None  # pętla generowania wygeneruje je ponownie
+                            st.rerun()
+
+                    with st.expander("🔍 Weryfikacja kompletności (agent-recenzent)",
+                                     expanded=bool(empty)):
+                        st.caption(
+                            "Agent sprawdza, czy wygenerowany zestaw plików wystarcza, by zmiana "
+                            "działała end-to-end (czy nie brakuje plików, do których odwołuje się kod)."
+                        )
+                        if st.button("Sprawdź kompletność zmiany", use_container_width=True):
+                            gen_files = [
+                                {
+                                    "repo": mc["repo"], "path": mc["file_path"],
+                                    "action": mc.get("action", "modify"),
+                                    "status": "ok" if (mc.get("new_content") or "").strip() else "empty",
+                                    "head": "\n".join((mc.get("new_content") or "").splitlines()[:15]),
+                                }
+                                for mc in multi
+                            ]
+                            with st.spinner("Agent weryfikuje kompletność zestawu plików…"):
+                                st.session_state.sandbox_verify = verify_completeness(
+                                    question, accepted_proposals,
+                                    build_repo_map(st.session_state.get("chunks", [])),
+                                    gen_files,
+                                )
+                            st.rerun()
+
+                        verdict = st.session_state.get("sandbox_verify")
+                        if verdict:
+                            if verdict["complete"]:
+                                st.success("✅ Agent: zestaw plików wygląda na kompletny.")
+                            else:
+                                st.warning(f"⚠️ Agent: zestaw niekompletny. {verdict.get('notes', '')}")
+                            if verdict.get("missing"):
+                                st.markdown("**Brakujące / do uzupełnienia pliki:**")
+                                for m in verdict["missing"]:
+                                    tag = "🆕 utwórz" if m["action"] == "create" else "✏️ zmień"
+                                    st.markdown(
+                                        f"- {tag} `{m['repo']}/{m['path']}`"
+                                        + (f" — {m['reason']}" if m.get("reason") else "")
+                                    )
+                                if st.button("➕ Dodaj brakujące do planu i wygeneruj",
+                                             type="primary", use_container_width=True):
+                                    repo_paths = st.session_state.get("repo_paths", {})
+                                    existing = {(mc["repo"], mc["file_path"]) for mc in multi}
+                                    added = 0
+                                    for m in verdict["missing"]:
+                                        if (m["repo"] not in repo_paths
+                                                or (m["repo"], m["path"]) in existing
+                                                or m["path"].endswith(".py")):
+                                            continue
+                                        rpath = repo_paths[m["repo"]]
+                                        action, orig = m["action"], ""
+                                        if action == "modify":
+                                            try:
+                                                with open(os.path.join(rpath, m["path"]), encoding="utf-8") as _f:
+                                                    orig = _f.read()
+                                            except OSError:
+                                                action = "create"
+                                        multi.append({
+                                            "repo": m["repo"], "file_path": m["path"], "action": action,
+                                            "original": orig, "repo_path": rpath, "reason": m.get("reason", ""),
+                                            "new_content": None, "diff": None, "error": None, "pr_result": None,
+                                        })
+                                        added += 1
+                                    st.session_state.sandbox_verify = None
+                                    st.session_state.sandbox_test_results = {}
+                                    if added:
+                                        st.toast(f"Dodano {added} plik(ów) do planu — generuję…")
+                                    st.rerun()
 
                     # Status PR per-repo (już wystawionych).
                     done_prs = [mc for mc in multi if mc.get("pr_result") is not None]
