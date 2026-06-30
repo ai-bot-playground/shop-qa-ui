@@ -1,0 +1,59 @@
+name: PR check
+
+# Lightweight PR gate for shop-qa-ui. Unlike the shop SERVICE repos (whose
+# pr-to-main.yml calls the self-hosted preprod-gate and deploys to kind), qa-ui
+# is NOT deployed into the cluster and has no self-hosted runner — so it runs its
+# OWN container self-tests on a GitHub-hosted runner. Opening a PR against any
+# base branch must pass: image build -> engine self-test (seeded bug RED->GREEN)
+# -> committed-sample validation -> GUI smoke. Make it required via branch
+# protection -> required status check "PR check / validate".
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: legacy-documenter:ci
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+
+      - name: Build app image (Docker)
+        run: docker build -f Containerfile -t "$IMAGE" .
+
+      - name: Engine self-test — seeded bug RED→GREEN (in container)
+        run: |
+          docker run --rm -e PYTHONUTF8=1 \
+            --entrypoint python "$IMAGE" scripts/ci_sandbox_check.py
+
+      - name: Validate committed sample — PR gate (in container)
+        run: |
+          cid=$(docker create -e PYTHONUTF8=1 \
+            --entrypoint python "$IMAGE" scripts/ci_validate_sample.py)
+          set +e
+          docker start -a "$cid"
+          rc=$?
+          set -e
+          docker cp "$cid:/app/ci_report.md" ci_report.md || true
+          docker rm "$cid" >/dev/null
+          exit "$rc"
+
+      - name: Smoke-test the GUI boots (in container)
+        run: CONTAINER_CLI=docker bash scripts/smoke_health.sh "$IMAGE"
+
+      - name: Upload CI report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report
+          path: ci_report.md
+          if-no-files-found: ignore
