@@ -438,10 +438,97 @@ def _resolve_local_repo(local_repo: str | None, repo_slug: str) -> str | None:
     return None
 
 
+def run_service_tests(repo_path: str, file_changes: list[tuple[str, str]],
+                      base: str = "main", timeout: int = 1800) -> dict:
+    """Odpala `./gradlew test` dla serwisu Z ZASTOSOWANĄ zmianą, w izolowanym worktree.
+
+    `file_changes` to lista (rel_path, new_content) — wszystkie pliki tego repo,
+    które zmienia bieżąca propozycja. Worktree bazuje na świeżym origin/<base>, więc
+    testujemy dokładnie to, co pójdzie do PR-a (czysto względem main + nasza zmiana).
+    Robocza kopia użytkownika pozostaje nietknięta.
+
+    Zwraca: {success, build_ok, summary, tail, duration_s, error}.
+    """
+    import shutil
+    import time
+    import uuid
+    from datetime import datetime
+
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        return {"success": False, "error": f"To nie jest repo git: {repo_path}"}
+
+    gradlew = os.path.join(repo_path, "gradlew")
+    if not os.path.isfile(gradlew):
+        return {"success": False, "error": "Brak ./gradlew — serwis nie używa Gradle."}
+
+    branch = f"ai-test/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    wt = os.path.join(_clone_base(), f"wt-test-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
+    worktree_added = False
+    t0 = time.time()
+    try:
+        # --prune czyści zepsute/nieistniejące już refy zdalne (np. po usunięciu
+        # gałęzi ai-change), które inaczej wywalają fetch „bad object".
+        f = subprocess.run(["git", "-C", repo_path, "fetch", "--prune", "origin", base],
+                           capture_output=True, text=True)
+        if f.returncode != 0:
+            return {"success": False, "error": f"fetch origin {base}: {f.stderr.strip()}"}
+
+        wadd = subprocess.run(
+            ["git", "-C", repo_path, "worktree", "add", "--detach", wt, f"origin/{base}"],
+            capture_output=True, text=True)
+        if wadd.returncode != 0:
+            return {"success": False, "error": f"worktree add: {wadd.stderr.strip()}"}
+        worktree_added = True
+
+        # Nałóż wszystkie zmienione pliki tego repo.
+        for rel_path, new_content in file_changes:
+            target = os.path.join(wt, rel_path.replace("/", os.sep))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(new_content if new_content.endswith("\n") else new_content + "\n")
+
+        # gradlew test (Testcontainers wymaga Dockera; toolchain może dociągnąć JDK).
+        # Uruchamiamy przez `sh gradlew` — w świeżym worktree skrypt bywa bez bitu
+        # wykonywalności (+x), więc `./gradlew` rzucałby PermissionError.
+        try:
+            r = subprocess.run(
+                ["sh", "gradlew", "test", "--console=plain", "--no-daemon"],
+                cwd=wt, capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {"success": False, "build_ok": False,
+                    "error": f"Przekroczono limit {timeout}s — testy zbyt długie.",
+                    "duration_s": round(time.time() - t0)}
+        except OSError as exc:
+            return {"success": False, "build_ok": False,
+                    "error": f"Nie udało się uruchomić gradlew: {exc}",
+                    "duration_s": round(time.time() - t0)}
+
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+        build_ok = r.returncode == 0
+        # Wyłuskaj zwięzłe podsumowanie z logu Gradle/JUnit, jeśli jest.
+        summary_lines = [ln for ln in out.splitlines()
+                         if "tests completed" in ln.lower() or "BUILD SUCCESSFUL" in ln
+                         or "BUILD FAILED" in ln or " failed" in ln.lower()]
+        summary = " · ".join(summary_lines[-3:]) if summary_lines else (
+            "BUILD SUCCESSFUL" if build_ok else "BUILD FAILED")
+        tail = "\n".join(out.splitlines()[-40:])
+        return {
+            "success": build_ok, "build_ok": build_ok, "summary": summary.strip(),
+            "tail": tail, "duration_s": round(time.time() - t0),
+        }
+    finally:
+        if worktree_added:
+            subprocess.run(["git", "-C", repo_path, "worktree", "remove", "--force", wt],
+                           capture_output=True, text=True)
+        shutil.rmtree(wt, ignore_errors=True)
+
+
 def open_pr_for_file_change(rel_path: str, new_content: str, title: str, body: str,
                             repo_slug: str, base: str = "main",
                             branch_prefix: str = "ai-change",
-                            local_repo: str | None = None) -> dict:
+                            local_repo: str | None = None,
+                            allow_create: bool = False) -> dict:
     """Na LOKALNYM repo: czysta gałąź z origin/<base> przez `git worktree`, nadpis
     JEDNEGO pliku treścią new_content, commit, push, PR. Bez klonowania z sieci.
 
@@ -483,7 +570,9 @@ def open_pr_for_file_change(rel_path: str, new_content: str, title: str, body: s
 
         target = os.path.join(wt, rel_path.replace("/", os.sep))
         if not os.path.isfile(target):
-            return {"success": False, "error": f"plik nie istnieje w {base}: {rel_path}"}
+            if not allow_create:
+                return {"success": False, "error": f"plik nie istnieje w {base}: {rel_path}"}
+            os.makedirs(os.path.dirname(target), exist_ok=True)  # nowy plik (action=create)
         with open(target, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(new_content if new_content.endswith("\n") else new_content + "\n")
 

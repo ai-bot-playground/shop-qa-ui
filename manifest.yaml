@@ -69,16 +69,3 @@ apps:
         role: "testy akceptacyjne e2e"
         lang: java
         indexable: true
-
-  - id: qa-tooling
-    name: "Narzędzia QA / dev"
-    description: "Ta aplikacja (shop-qa-ui) i metryki tokenów — meta-warstwa nad sklepem."
-    repos:
-      - name: shop-qa-ui
-        role: "AI dev-frontend (ta aplikacja)"
-        lang: python
-        indexable: true
-      - name: shop-token-metrics
-        role: "metryki zużycia tokenów LLM"
-        lang: java
-        indexable: true
