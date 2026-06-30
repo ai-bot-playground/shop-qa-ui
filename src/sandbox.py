@@ -402,6 +402,37 @@ def pr_checks(repo_slug: str, branch: str) -> dict:
         return {"available": False, "message": "nie udało się odczytać statusu", "checks": []}
 
 
+def pr_failure_summary(repo_slug: str, branch: str, max_lines: int = 40) -> str:
+    """Best-effort opis błędu z CI dla gałęzi PR: tail logu nieudanych kroków.
+
+    Pusty string gdy logu nie ma (np. self-hosted runner bywa nie zachowuje
+    logów w API) — wtedy UI pokazuje przynajmniej nazwy nieudanych checków.
+    """
+    import json as _json
+    r = subprocess.run(
+        ["gh", "run", "list", "--repo", repo_slug, "--branch", branch, "--limit", "1",
+         "--json", "databaseId,conclusion"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return ""
+    try:
+        runs = _json.loads(r.stdout)
+    except Exception:
+        return ""
+    if not runs:
+        return ""
+    rid = str(runs[0].get("databaseId", ""))
+    if not rid:
+        return ""
+    lg = subprocess.run(["gh", "run", "view", rid, "--repo", repo_slug, "--log-failed"],
+                        capture_output=True, text=True)
+    out = (lg.stdout or "").strip()
+    if not out:
+        return ""
+    return "\n".join(out.splitlines()[-max_lines:])
+
+
 def merge_pr(repo_slug: str, branch: str, strategy: str = "--squash") -> dict:
     """Merge PR-a danej gałęzi do base (domyślnie squash) i usuń gałąź. Auth: gh."""
     r = subprocess.run(
@@ -524,25 +555,24 @@ def run_service_tests(repo_path: str, file_changes: list[tuple[str, str]],
         shutil.rmtree(wt, ignore_errors=True)
 
 
-def open_pr_for_file_change(rel_path: str, new_content: str, title: str, body: str,
-                            repo_slug: str, base: str = "main",
-                            branch_prefix: str = "ai-change",
-                            local_repo: str | None = None,
-                            allow_create: bool = False) -> dict:
-    """Na LOKALNYM repo: czysta gałąź z origin/<base> przez `git worktree`, nadpis
-    JEDNEGO pliku treścią new_content, commit, push, PR. Bez klonowania z sieci.
+def open_pr_for_files(file_changes: list[dict], title: str, body: str,
+                      repo_slug: str, base: str = "main",
+                      branch_prefix: str = "ai-change",
+                      local_repo: str | None = None) -> dict:
+    """JEDEN PR dla repo zbierający WIELE plików. `file_changes` to lista dictów
+    {path, content, allow_create}. Wszystkie pliki lądują w jednej gałęzi/commicie.
 
-    `git worktree` izoluje operację: Twoja bieżąca kopia robocza i gałąź pozostają
-    nietknięte, a nowa gałąź zawiera wyłącznie tę jedną zmianę (bazuje na świeżo
-    pobranym origin/<base>, więc PR jest czysty względem main). git sam liczy
-    diff/commit → zero ryzyka uszkodzonego patcha z LLM. Auth: gh.
+    `git worktree` izoluje operację: bieżąca kopia robocza i gałąź pozostają
+    nietknięte, a nowa gałąź bazuje na świeżo pobranym origin/<base> (PR czysty
+    względem main). git sam liczy diff/commit. Auth: gh.
     """
     import shutil
     import uuid
     from datetime import datetime
 
-    if not new_content.strip():
-        return {"success": False, "error": "Pusta treść pliku — nic do wystawienia."}
+    writable = [fc for fc in file_changes if (fc.get("content") or "").strip()]
+    if not writable:
+        return {"success": False, "error": "Brak treści plików — nic do wystawienia."}
 
     repo = _resolve_local_repo(local_repo, repo_slug)
     if not repo:
@@ -555,8 +585,8 @@ def open_pr_for_file_change(rel_path: str, new_content: str, title: str, body: s
     wt = os.path.join(_clone_base(), f"wt-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
     worktree_added = False
     try:
-        # Świeży base z origin (fetch, NIE clone), by gałąź była czysta wzgl. main.
-        f = subprocess.run(["git", "-C", repo, "fetch", "origin", base],
+        # Świeży base z origin (--prune czyści zepsute refy), by gałąź była czysta wzgl. main.
+        f = subprocess.run(["git", "-C", repo, "fetch", "--prune", "origin", base],
                            capture_output=True, text=True)
         if f.returncode != 0:
             return {"success": False, "error": f"fetch origin {base}: {f.stderr.strip()}"}
@@ -568,13 +598,16 @@ def open_pr_for_file_change(rel_path: str, new_content: str, title: str, body: s
             return {"success": False, "error": f"worktree add: {wadd.stderr.strip()}"}
         worktree_added = True
 
-        target = os.path.join(wt, rel_path.replace("/", os.sep))
-        if not os.path.isfile(target):
-            if not allow_create:
-                return {"success": False, "error": f"plik nie istnieje w {base}: {rel_path}"}
-            os.makedirs(os.path.dirname(target), exist_ok=True)  # nowy plik (action=create)
-        with open(target, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(new_content if new_content.endswith("\n") else new_content + "\n")
+        for fc in writable:
+            rel_path = fc["path"]
+            content = fc["content"]
+            target = os.path.join(wt, rel_path.replace("/", os.sep))
+            if not os.path.isfile(target):
+                if not fc.get("allow_create"):
+                    return {"success": False, "error": f"plik nie istnieje w {base}: {rel_path}"}
+                os.makedirs(os.path.dirname(target), exist_ok=True)  # nowy plik
+            with open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(content if content.endswith("\n") else content + "\n")
 
         stt = subprocess.run(["git", "-C", wt, "status", "--porcelain"],
                              capture_output=True, text=True)
@@ -606,3 +639,15 @@ def open_pr_for_file_change(rel_path: str, new_content: str, title: str, body: s
             subprocess.run(["git", "-C", repo, "branch", "-D", branch],
                            capture_output=True, text=True)
         shutil.rmtree(wt, ignore_errors=True)
+
+
+def open_pr_for_file_change(rel_path: str, new_content: str, title: str, body: str,
+                            repo_slug: str, base: str = "main",
+                            branch_prefix: str = "ai-change",
+                            local_repo: str | None = None,
+                            allow_create: bool = False) -> dict:
+    """Cienki wrapper na open_pr_for_files dla pojedynczego pliku (kompatybilność)."""
+    return open_pr_for_files(
+        [{"path": rel_path, "content": new_content, "allow_create": allow_create}],
+        title, body, repo_slug, base, branch_prefix, local_repo,
+    )

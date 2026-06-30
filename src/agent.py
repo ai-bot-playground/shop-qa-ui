@@ -342,6 +342,34 @@ Zasady:
 - Odpowiadaj po polsku w polu reason.\
 """
 
+_VERIFY_SYSTEM = """\
+Jesteś recenzentem kompletności zmiany w systemie opisanym w KONTEKST SYSTEMU.
+Otrzymujesz żądaną zmianę, MAPĘ REPOZYTORIÓW oraz listę WYGENEROWANYCH PLIKÓW (z fragmentami
+treści i statusem: ok = ma treść, empty = model nie wygenerował treści).
+
+Oceń, czy zestaw plików jest KOMPLETNY i spójny, by zmiana RZECZYWIŚCIE działała end-to-end:
+- czy brakuje plików, do których odwołuje się wygenerowany kod (komponent zaimportowany, ale
+  nieutworzony; DTO/encja/endpoint/konfiguracja; rejestracja beana; routing; nagłówek po stronie
+  klienta i jego odbiór po stronie serwera),
+- czy pliki ze statusem "empty" trzeba jednak wygenerować, bo są potrzebne,
+- czy warstwy się spinają (UI → gateway → serwis → dane).
+
+Odpowiedz WYŁĄCZNIE prawidłowym JSON (bez markdown):
+{
+  "complete": true|false,
+  "notes": "<zwięźle po polsku: czego brakuje albo że jest kompletne>",
+  "missing": [
+    {"repo": "<repo z MAPY>", "path": "<ścieżka>", "action": "create|modify", "reason": "<po co>"}
+  ]
+}
+
+Zasady:
+- "repo" wyłącznie z MAPY REPOZYTORIÓW.
+- NIE powtarzaj plików już poprawnie wygenerowanych (status ok), chyba że wymagają korekty.
+- Jeśli wszystko jest na miejscu → "complete": true oraz "missing": [].
+- Odpowiadaj po polsku w polach tekstowych.\
+"""
+
 _NEWFILE_SYSTEM = """\
 Jesteś senior developerem systemu opisanego w KONTEKST SYSTEMU. Tworzysz NOWY plik od zera.
 
@@ -504,6 +532,52 @@ def plan_change(question: str, repo_map: str, proposals: list[dict]) -> list[dic
             "reason": (f.get("reason") or "").strip(),
         })
     return out
+
+
+def verify_completeness(question: str, proposals: list[dict], repo_map: str,
+                        generated_files: list[dict]) -> dict:
+    """Agent-recenzent: czy wygenerowany zestaw plików jest kompletny i spójny.
+
+    `generated_files`: lista {repo, path, action, status: ok|empty, head}.
+    Zwraca {complete: bool, notes: str, missing: [{repo, path, action, reason}]}.
+    """
+    listing = "\n\n".join(
+        f"### {g['repo']}/{g['path']}  [{g.get('action', 'modify')}, {g.get('status', 'ok')}]\n"
+        f"{g.get('head', '')}"
+        for g in generated_files
+    )
+    props = "\n".join(f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or []))
+    user_msg = (
+        f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
+        f"MAPA REPOZYTORIÓW:\n{repo_map}\n\n"
+        f"ŻĄDANA ZMIANA: {question}\n"
+        f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
+        f"WYGENEROWANE PLIKI:\n{listing}\n\n"
+        f"Zwróć ocenę kompletności jako JSON:"
+    )
+    try:
+        data = _extract_json(_call(_VERIFY_SYSTEM, user_msg, max_tokens=2048))
+    except Exception:
+        return {"complete": True, "notes": "", "missing": []}
+    missing: list[dict] = []
+    seen: set = set()
+    for f in (data.get("missing") or []):
+        repo = (f.get("repo") or "").strip()
+        path = (f.get("path") or "").strip().lstrip("/")
+        action = (f.get("action") or "create").strip().lower()
+        if not repo or not path or (repo, path) in seen:
+            continue
+        seen.add((repo, path))
+        missing.append({
+            "repo": repo, "path": path,
+            "action": "modify" if action == "modify" else "create",
+            "reason": (f.get("reason") or "").strip(),
+        })
+    return {
+        "complete": bool(data.get("complete")) and not missing,
+        "notes": (data.get("notes") or "").strip(),
+        "missing": missing,
+    }
 
 
 def generate_new_file(question: str, proposals: list[dict], repo: str, file_path: str) -> str:
@@ -713,4 +787,6 @@ def _mock_call(system: str, user_content: str, max_tokens: int = 1024) -> str:
         return ""  # tryb demo: realna zmiana wymaga podłączonego modelu
     if system is _PLAN_SYSTEM:
         return "{}"  # tryb demo: brak planu
+    if system is _VERIFY_SYSTEM:
+        return '{"complete": true, "notes": "[demo]", "missing": []}'
     return _mock_tech_answer(user_content)
