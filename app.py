@@ -16,7 +16,8 @@ from src.agent import (
 from src.sandbox import (
     run_static_tests, replace_function_in_file, git_commit_file, commit_and_push_change,
     run_qa_eval, check_diff_applies, open_pr_for_change, compute_diff,
-    open_pr_for_file_change, pr_checks, merge_pr, run_service_tests,
+    open_pr_for_file_change, pr_checks, merge_pr, run_service_tests, open_pr_for_files,
+    pr_failure_summary,
 )
 from src.answer_types import ANSWER_TYPES, get_default_templates
 
@@ -35,6 +36,23 @@ def _lang_for(path: str) -> str:
     if p.endswith((".yml", ".yaml")):
         return "yaml"
     return "python"
+
+
+def _pr_build_state(data: dict | None) -> str:
+    """Agreguje statusy checków PR (z pr_checks) do jednego: success|pending|failure|unknown."""
+    if not data or not data.get("available"):
+        return "unknown"
+    checks = data.get("checks", [])
+    if not checks:
+        return "pending"  # bramka jeszcze nie wystartowała
+    buckets = [(c.get("bucket") or c.get("state") or "").lower() for c in checks]
+    if any(b in ("fail", "failure", "error", "cancelled", "timed_out") for b in buckets):
+        return "failure"
+    if any(b in ("pending", "", "queued", "in_progress", "running", "none", "waiting", "expected", "startup_failure") for b in buckets):
+        return "pending"
+    if all(b in ("pass", "success", "skipping", "skipped", "neutral") for b in buckets):
+        return "success"
+    return "pending"
 
 
 st.set_page_config(
@@ -882,47 +900,60 @@ elif active_tab == "sandbox":
                         if mc.get("pr_result") is None and (mc.get("diff") or "").strip()
                     ]
                     if pending and has_any_diff:
+                        # Grupuj zmiany po repo — JEDEN PR per repo zbiera wszystkie jego pliki.
+                        pending_by_repo: dict = {}
+                        for mc in pending:
+                            pending_by_repo.setdefault(mc["repo"], []).append(mc)
+                        n_repos_p = len(pending_by_repo)
                         default_title = (
                             accepted_proposals[0].get("commit_hint") if accepted_proposals
-                            else f"change: {len(pending)} serwisów"
+                            else f"change: {n_repos_p} serwisów"
                         )
                         pr_title = st.text_input("Tytuł PR / commit", value=default_title or "change")
-                        n_p = len(pending)
                         st.caption("Walidacja testowa wykona się w CI (`preprod-gate`) po utworzeniu PR.")
                         if st.button(
-                            f"🚀 Wystaw {'PR' if n_p == 1 else f'{n_p} PRy/PRów'} "
-                            f"({n_p} {'repozytorium' if n_p == 1 else 'repozytoria/repozytoriów'})",
+                            f"🚀 Wystaw {'PR' if n_repos_p == 1 else f'{n_repos_p} PRy/PRów'} "
+                            f"({n_repos_p} {'repozytorium' if n_repos_p == 1 else 'repozytoria/repozytoriów'})",
                             type="primary", use_container_width=True,
                         ):
-                            with st.spinner(f"Wystawiam {n_p} PR-ów…"):
-                                for mc in pending:
-                                    rs = open_pr_for_file_change(
-                                        mc["file_path"], mc["new_content"],
-                                        pr_title.strip() or f"change: {mc['repo']}",
+                            with st.spinner(f"Wystawiam {n_repos_p} PR-ów (po jednym na repo)…"):
+                                for repo, mcs in pending_by_repo.items():
+                                    files = [
+                                        {"path": mc["file_path"], "content": mc["new_content"],
+                                         "allow_create": mc.get("action") == "create"}
+                                        for mc in mcs
+                                    ]
+                                    rs = open_pr_for_files(
+                                        files,
+                                        pr_title.strip() or f"change: {repo}",
                                         "PR wygenerowany przez shop-qa-ui. Walidacja: bramka preprod-gate.",
-                                        f"ai-bot-playground/{mc['repo']}",
-                                        local_repo=mc["repo_path"],
-                                        allow_create=(mc.get("action") == "create"),
+                                        f"ai-bot-playground/{repo}",
+                                        local_repo=mcs[0]["repo_path"],
                                     )
-                                    mc["pr_result"] = rs
+                                    for mc in mcs:  # ten sam wynik PR dla wszystkich plików repo
+                                        mc["pr_result"] = rs
                             all_attempted = all(
                                 mc.get("pr_result") is not None
                                 for mc in multi if (mc.get("diff") or "").strip()
                             )
                             if all_attempted:
                                 st.session_state.sandbox_commit_done = "multi"
-                                st.session_state.qa_multi_prs = [
-                                    {
+                                # Jeden wpis per repo (nie per plik).
+                                by_repo_pr: dict = {}
+                                for mc in multi:
+                                    if not (mc.get("diff") or "").strip():
+                                        continue
+                                    pr = mc.get("pr_result") or {}
+                                    by_repo_pr[mc["repo"]] = {
                                         "repo": mc["repo"],
                                         "repo_slug": f"ai-bot-playground/{mc['repo']}",
-                                        "pr_url": (mc.get("pr_result") or {}).get("pr_url", ""),
-                                        "branch": (mc.get("pr_result") or {}).get("branch", ""),
-                                        "success": (mc.get("pr_result") or {}).get("success", False),
-                                        "error": (mc.get("pr_result") or {}).get("error", ""),
-                                        "warning": (mc.get("pr_result") or {}).get("warning", ""),
+                                        "pr_url": pr.get("pr_url", ""),
+                                        "branch": pr.get("branch", ""),
+                                        "success": pr.get("success", False),
+                                        "error": pr.get("error", ""),
+                                        "warning": pr.get("warning", ""),
                                     }
-                                    for mc in multi if (mc.get("diff") or "").strip()
-                                ]
+                                st.session_state.qa_multi_prs = list(by_repo_pr.values())
                                 _advance()
                             st.rerun()
                     elif not pending and done_prs:
@@ -1092,26 +1123,84 @@ elif active_tab == "sandbox":
 elif active_tab == "pr":
     st.title("Pull Request")
 
-    # ── Ścieżka multi-repo (wiele PRów cross-repo) ──
+    # ── Ścieżka multi-repo (wiele PRów cross-repo) — podsumowanie + status buildów ──
     if st.session_state.get("qa_multi_prs"):
         multi_prs = st.session_state.qa_multi_prs
-        successful = [pr for pr in multi_prs if pr["success"]]
+        opened = [pr for pr in multi_prs if pr["success"]]
         n_repos = len({pr["repo"] for pr in multi_prs})
-        st.markdown(f"### {len(multi_prs)} Pull Requestów w {n_repos} repozytoriach")
-        st.markdown(f"**{len(successful)}/{len(multi_prs)}** otwartych pomyślnie.")
-        for pr in multi_prs:
-            icon = "✅" if pr["success"] else ("⚠️" if pr.get("warning") else "❌")
-            with st.expander(f"{icon} `{pr['repo_slug']}`", expanded=not pr["success"]):
-                if pr["success"]:
-                    st.success(f"PR otwarty: {pr['pr_url']}")
+        st.markdown(f"### Podsumowanie PR — {len(multi_prs)} w {n_repos} repozytoriach")
+        st.caption(
+            f"{len(opened)}/{len(multi_prs)} otwartych pomyślnie. "
+            "Status buildu (`preprod-gate`) odświeża się automatycznie co 15 s."
+        )
+
+        @st.fragment(run_every=15)
+        def _pr_status_panel():
+            agg = {"success": 0, "pending": 0, "failure": 0, "unknown": 0, "nieotwarte": 0}
+            rows = []
+            for pr in multi_prs:
+                if not pr["success"]:
+                    agg["nieotwarte"] += 1
+                    rows.append((pr, "nieotwarte", None))
+                    continue
+                data = pr_checks(pr["repo_slug"], pr["branch"]) if pr.get("branch") else None
+                state = _pr_build_state(data)
+                agg[state] = agg.get(state, 0) + 1
+                rows.append((pr, state, data))
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("✅ Success", agg["success"])
+            c2.metric("⏳ Pending", agg["pending"] + agg["unknown"])
+            c3.metric("❌ Failed", agg["failure"])
+            c4.metric("⚠️ Nieotwarte", agg["nieotwarte"])
+
+            icons = {"success": "✅", "pending": "⏳", "failure": "❌",
+                     "unknown": "⏳", "nieotwarte": "⚠️"}
+            for pr, state, data in rows:
+                with st.expander(f"{icons[state]} `{pr['repo_slug']}` — {state}",
+                                 expanded=state in ("failure", "nieotwarte")):
+                    if state == "nieotwarte":
+                        if pr.get("warning"):
+                            st.warning(pr["warning"])
+                        else:
+                            st.error(f"PR nie został otwarty: {pr.get('error', 'nieznany błąd')}")
+                        st.caption(f"Gałąź: `{pr.get('branch', '—')}`")
+                        continue
                     if pr["pr_url"]:
                         st.link_button("Otwórz PR na GitHub", pr["pr_url"], use_container_width=True)
-                    st.caption(f"Gałąź: `{pr['branch']}` · wymagany check **preprod-gate**")
-                elif pr.get("warning"):
-                    st.warning(pr["warning"])
-                    st.caption(f"Gałąź: `{pr['branch']}`")
-                else:
-                    st.error(f"Błąd: {pr['error']}")
+                    st.caption(f"Gałąź: `{pr['branch']}` · check **preprod-gate**")
+                    if state == "success":
+                        st.success("Build zielony — PR gotowy do przeglądu/merge.")
+                    elif state == "pending":
+                        st.info("Build w toku — bramka `preprod-gate` jeszcze się wykonuje.")
+                    elif state == "failure":
+                        st.error(
+                            "❌ Build nieudany. **Deweloper powinien zajrzeć do tego PR i go naprawić** "
+                            "— zmiana wygenerowana automatycznie nie przeszła bramki preprod."
+                        )
+                        # Które checki padły (+ linki do logów na GitHub).
+                        failed_checks = [
+                            c for c in (data or {}).get("checks", [])
+                            if (c.get("bucket") or c.get("state") or "").lower()
+                            in ("fail", "failure", "error", "cancelled", "timed_out")
+                        ]
+                        if failed_checks:
+                            st.markdown("**Nieudane checki:**")
+                            for c in failed_checks:
+                                link = f" — [log CI]({c['link']})" if c.get("link") else ""
+                                st.markdown(f"- ❌ {c.get('name', '?')}{link}")
+                        # Best-effort opis błędu z logu CI (self-hosted bywa bez logów).
+                        summary = pr_failure_summary(pr["repo_slug"], pr["branch"])
+                        if summary:
+                            with st.expander("Opis błędu (log CI)"):
+                                st.code(summary, language=None)
+                        elif not failed_checks:
+                            st.caption("Brak szczegółów w API — otwórz PR, by zobaczyć log bramki.")
+            st.caption(f"Ostatnie odświeżenie: {datetime.now():%H:%M:%S}")
+
+        _pr_status_panel()
+        if st.button("🔄 Odśwież teraz", use_container_width=True):
+            st.rerun()
         st.stop()
 
     # ── Ścieżka Java (serwis sklepu): PR + status bramki preprod + merge ──
