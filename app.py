@@ -1,20 +1,22 @@
+import json
 import os
 import sys
 import uuid
+from collections import Counter
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(__file__))
 
 import streamlit as st
 import pandas as pd
-from src.ingest import ingest_repo
+from src.ingest import ingest_repo, ingest_app
 from src.agent import (
     run_qa, generate_code_fix, fix_code_with_tests, generate_change_diff,
-    generate_file_change, is_demo_mode,
+    generate_file_change, is_demo_mode, plan_change, build_repo_map, generate_new_file,
 )
 from src.sandbox import (
     run_static_tests, replace_function_in_file, git_commit_file, commit_and_push_change,
     run_qa_eval, check_diff_applies, open_pr_for_change, compute_diff,
-    open_pr_for_file_change, pr_checks, merge_pr,
+    open_pr_for_file_change, pr_checks, merge_pr, run_service_tests,
 )
 from src.answer_types import ANSWER_TYPES, get_default_templates
 
@@ -88,6 +90,31 @@ def _active_session() -> dict:
 def _active_messages() -> list:
     return _active_session()["messages"]
 
+# Trwała historia pytań — append-only JSONL (przetrwa restart aplikacji,
+# w przeciwieństwie do st.session_state). Jedna linia = jedno zapytanie.
+_QLOG_PATH = os.path.join(os.path.dirname(__file__), "logs", "questions.jsonl")
+
+def _log_question(question: str, result: dict, app_id: str | None) -> None:
+    """Best-effort zapis pytania do questions.jsonl. Nigdy nie psuje UI."""
+    try:
+        os.makedirs(os.path.dirname(_QLOG_PATH), exist_ok=True)
+        chunks = result.get("retrieved_chunks", []) or []
+        feas = result.get("feasibility") or {}
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "session_id": st.session_state.active_session_id,
+            "app": app_id,
+            "question": question,
+            "demo_mode": is_demo_mode(),
+            "repos_hit": sorted({c.repo for c in chunks if c.repo}),
+            "citations": [f"{c.repo}/{c.file_path}:{c.start_line}" for c in chunks],
+            "impacted_services": feas.get("impacted_services", []),
+        }
+        with open(_QLOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # historia jest pomocnicza — cisza przy awarii
+
 # ── Workflow steps ─────────────────────────────────────────────────────────────
 STEPS = [
     ("ready",   "System Ready"),
@@ -115,59 +142,106 @@ def _advance():
         st.session_state.active_tab = STEP_KEYS[idx + 1]
         st.rerun()
 
+def _load_app_options():
+    """Czyta manifest.yaml i zwraca (lista_aplikacji, domyślne_id_app).
+
+    Każda aplikacja to dict {id, name, repos: [{name, path}]} gdzie repos
+    zawiera tylko repozytoria `indexable: true` z istniejącym katalogiem.
+    Ścieżki rozwijane względem `workspace_root` z manifestu (nadpisywalne
+    SHOP_REPOS_DIR). Fallback: jedna syntetyczna aplikacja z repo shop-*.
+    """
+    here = os.path.dirname(__file__)
+    env_root = os.environ.get("SHOP_REPOS_DIR")
+    manifest = None
+    try:
+        import yaml
+        with open(os.path.join(here, "manifest.yaml"), encoding="utf-8") as fh:
+            manifest = yaml.safe_load(fh) or {}
+    except Exception:
+        manifest = None
+
+    if manifest:
+        root = env_root or os.path.abspath(os.path.join(here, manifest.get("workspace_root", "..")))
+        apps = []
+        for app in manifest.get("apps", []):
+            repos = [
+                {"name": r["name"], "path": os.path.join(root, r["name"])}
+                for r in app.get("repos", [])
+                if r.get("indexable") and os.path.isdir(os.path.join(root, r["name"]))
+            ]
+            if repos:
+                apps.append({"id": app["id"], "name": app["name"], "repos": repos})
+        default_id = apps[0]["id"] if apps else None
+        return apps, default_id
+
+    # Fallback — jedna aplikacja ze skanem shop-* (gdy brak manifestu / PyYAML).
+    root = env_root or os.path.abspath(os.path.join(here, ".."))
+    repos = []
+    if os.path.isdir(root):
+        repos = [
+            {"name": d, "path": os.path.join(root, d)}
+            for d in sorted(os.listdir(root))
+            if d.startswith("shop-") and os.path.isdir(os.path.join(root, d))
+        ]
+    apps = [{"id": "shop", "name": "Sklep (fallback)", "repos": repos}] if repos else []
+    return apps, (apps[0]["id"] if apps else None)
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🔍 Analizator Kodu")
     st.caption("Wiedza plemienna — odblokowana")
     st.divider()
 
-    # Indeksowanie — domyślnie celujemy w serwisy naszego sklepu
-    # (sibling repo ai-bot-playground; nadpisywalne przez SHOP_REPOS_DIR).
-    shop_dir = os.environ.get(
-        "SHOP_REPOS_DIR",
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ai-bot-playground")),
-    )
-    service_path = None
-    if os.path.isdir(shop_dir):
-        services = sorted(
-            d for d in os.listdir(shop_dir)
-            if d.startswith("shop-") and os.path.isdir(os.path.join(shop_dir, d))
+    # Indeksowanie — selektor aplikacji z manifest.yaml. Wybranie aplikacji
+    # indeksuje WSZYSTKIE jej repozytoria naraz; użytkownik nie musi wiedzieć,
+    # w którym repo leży kod.
+    app_options, default_app_id = _load_app_options()
+    chosen_app = None
+    if app_options:
+        app_ids = [a["id"] for a in app_options]
+        default_idx = app_ids.index(default_app_id) if default_app_id in app_ids else 0
+        chosen_app_id = st.selectbox(
+            "Aplikacja", app_ids, index=default_idx,
+            format_func=lambda aid: next((a["name"] for a in app_options if a["id"] == aid), aid),
+            help="Indeksuje wszystkie repozytoria aplikacji (z manifest.yaml)",
         )
-        if services:
-            default_idx = services.index("shop-notification") if "shop-notification" in services else 0
-            chosen = st.selectbox(
-                "Serwis sklepu", services, index=default_idx,
-                help=f"Katalogi shop-* w {shop_dir}",
-            )
-            service_path = os.path.join(shop_dir, chosen)
+        chosen_app = next((a for a in app_options if a["id"] == chosen_app_id), None)
+        if chosen_app:
+            repo_names = [r["name"] for r in chosen_app["repos"]]
+            st.caption(f"{len(repo_names)} repo: {', '.join(repo_names)}")
 
-    repo_path = st.text_input(
-        "Ścieżka do repozytorium",
-        value=os.environ.get(
-            "REPO_PATH",
-            service_path or os.path.join(os.path.dirname(__file__), "sample"),
-        ),
-        help="Ścieżka do katalogu z kodem (nadpisuje wybór serwisu powyżej)",
-    )
-    if st.button("⚡ Indeksuj repozytorium", use_container_width=True):
-        if not os.path.isdir(repo_path):
-            st.error(f"Katalog nie istnieje: {repo_path}")
+    if st.button("⚡ Indeksuj aplikację", use_container_width=True):
+        repos_to_index = chosen_app["repos"] if chosen_app else []
+        if not repos_to_index:
+            st.error("Brak repozytoriów do zaindeksowania — sprawdź manifest.yaml.")
         else:
-            with st.spinner("Indeksowanie…"):
-                chunks = ingest_repo(repo_path)
+            with st.spinner(f"Indeksowanie {len(repos_to_index)} repozytoriów…"):
+                chunks = ingest_app(repos_to_index)
             st.session_state.chunks = chunks
-            st.session_state.repo_path = repo_path
+            st.session_state.repo_paths = {r["name"]: r["path"] for r in repos_to_index}
+            st.session_state.active_app_id = chosen_app["id"] if chosen_app else None
             if st.session_state.active_tab == "ready":
                 st.session_state.active_tab = "analyze"
             st.rerun()
 
     if st.session_state.get("chunks"):
-        st.success(f"✅ {len(st.session_state.chunks)} symboli")
+        chunks = st.session_state.chunks
+        repos_in_index = [r for r in st.session_state.get("repo_paths", {})]
+        per_repo = Counter(c.repo for c in chunks)
+        st.success(f"✅ {len(chunks)} symboli z {len(repos_in_index)} repo")
+        with st.expander(f"Rozkład: {len(repos_in_index)} repozytoriów"):
+            st.dataframe(
+                pd.DataFrame(
+                    [{"Repo": r, "Symboli": per_repo.get(r, 0)} for r in repos_in_index]
+                ),
+                use_container_width=True, hide_index=True,
+            )
         with st.expander("Zaindeksowane symbole"):
             st.dataframe(
                 pd.DataFrame([
-                    {"Symbol": c.symbol, "Plik": c.file_path, "Linie": f"{c.start_line}–{c.end_line}"}
-                    for c in st.session_state.chunks
+                    {"Repo": c.repo, "Symbol": c.symbol, "Plik": c.file_path,
+                     "Linie": f"{c.start_line}–{c.end_line}"}
+                    for c in chunks
                 ]),
                 use_container_width=True, hide_index=True,
             )
@@ -345,35 +419,11 @@ if active_tab == "ready":
 # ═══════════════════════════════════════════════════════════════════════════════
 elif active_tab == "analyze":
     st.title("Analyze")
-    st.markdown(
-        "Zadaj pytanie w języku naturalnym i otrzymaj odpowiedź "
-        "**z dokładnymi cytowaniami `plik:linia`**. "
-        "Przełącz tryb aby zobaczyć widok biznesowy lub techniczny."
-    )
 
     if "chunks" not in st.session_state:
-        st.warning("Najpierw zaindeksuj repozytorium (panel boczny).")
+        st.warning("Najpierw zaindeksuj aplikację (panel boczny).")
     else:
-        # ── Typ odpowiedzi ──
-        type_labels = [cfg["label"] for cfg in ANSWER_TYPES.values()]
-        type_keys = list(ANSWER_TYPES.keys())
-        current_mode_idx = type_keys.index(st.session_state.answer_mode) if st.session_state.answer_mode in type_keys else 0
-        chosen_label = st.radio(
-            "Typ odpowiedzi", type_labels, index=current_mode_idx, horizontal=True,
-            label_visibility="collapsed",
-        )
-        st.session_state.answer_mode = type_keys[type_labels.index(chosen_label)]
-        mode = st.session_state.answer_mode
-
-        # ── Konfiguracja szablonu ──
-        with st.expander("⚙️ Konfiguruj szablon odpowiedzi"):
-            fields = st.session_state.answer_templates.get(mode, [])
-            for field in fields:
-                field["visible"] = st.checkbox(
-                    field["label"], value=field["visible"], key=f"tpl_{mode}_{field['key']}"
-                )
-
-        # ── Pole pytania ──
+        # ── Pole pytania (główna akcja, na samej górze) ──
         prefill = st.session_state.pop("context_prefill", "")
         col_q, col_btn = st.columns([5, 1])
         with col_q:
@@ -395,7 +445,8 @@ elif active_tab == "analyze":
 
         if ask_clicked and question.strip():
             with st.spinner("Szukam…"):
-                result = run_qa(question, st.session_state.repo_path)
+                result = run_qa(question, chunks=st.session_state.chunks)
+            _log_question(question, result, st.session_state.get("active_app_id"))
             _active_session()["messages"].insert(0, {
                 "question": question,
                 "answer": result["answer"],
@@ -404,7 +455,9 @@ elif active_tab == "analyze":
                 "feasibility": result.get("feasibility"),
                 "test_plan": result.get("test_plan"),
                 "proposals": result.get("proposals", []),
-                "accepted_proposal_idx": None,
+                "recommended_index": result.get("recommended_index"),
+                "recommended_reason": result.get("recommended_reason"),
+                "accepted_proposal_indices": None,
                 "ts": datetime.now().strftime("%H:%M"),
             })
             st.rerun()
@@ -412,141 +465,192 @@ elif active_tab == "analyze":
         # ── Historia aktywnej sesji ──
         messages = _active_messages()
         if not messages:
-            st.caption("Brak wiadomości w tym wątku.")
+            st.caption("Brak wiadomości w tym wątku. Zadaj pytanie powyżej.")
 
         for i, item in enumerate(messages):
+            biz = item.get("business_context")
+            feas = item.get("feasibility")
+            tp = item.get("test_plan")
+            chunks_item = item.get("chunks", [])
+            proposals = item.get("proposals", [])
+
             with st.container(border=True):
-                st.caption(f"🕐 {item.get('ts', '')}  —  {_active_session()['name']}")
-                st.markdown(f"**Pytanie:** {item['question']}")
+                st.markdown(f"**🔍 {item['question']}**")
+                st.caption(f"🕐 {item.get('ts', '')} — {_active_session()['name']}")
 
-                biz = item.get("business_context")
-                chunks_item = item.get("chunks", [])
-                proposals = item.get("proposals", [])
+                # ── Odpowiedź w zakładkach ──
+                tab_sum, tab_feas, tab_test, tab_src = st.tabs(
+                    ["📊 Podsumowanie", "✅ Wykonalność", "🧪 Plan testów", "📎 Źródła"]
+                )
 
-                # ── SEKCJA: Problem ──────────────────────────────────────────
-                st.markdown("#### Problem")
-                if mode == "business":
+                with tab_sum:
                     if biz:
-                        visible_keys = {
-                            f["key"] for f in st.session_state.answer_templates.get("business", [])
-                            if f["visible"]
-                        }
-                        if "summary" in visible_keys:
-                            st.markdown(f"{biz['summary']}")
-                            st.markdown("")
-                        if "time_metrics" in visible_keys:
-                            m1, m2, m3 = st.columns(3)
-                            m1.metric("⏱ Dev", biz["time_dev"])
-                            m2.metric("🧪 Test", biz["time_test"])
-                            m3.metric("📅 Łącznie", biz["time_total"])
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("⏱ Dev", biz.get("time_dev", "—"))
+                        m2.metric("🧪 Test", biz.get("time_test", "—"))
+                        m3.metric("📅 Łącznie", biz.get("time_total", "—"))
                         c1, c2 = st.columns(2)
-                        if "impact" in visible_keys:
-                            icon = "🔴" if biz["impact"] == "Wysoki" else "🟡"
-                            c1.markdown(f"**Impact:** {icon} {biz['impact']}  \n**Obszar:** {biz['area']}")
-                        if "risk" in visible_keys:
-                            ricon = "🔴" if "Wysoki" in biz["risk"] else "🟡"
-                            c2.markdown(f"**Ryzyko:** {ricon} {biz['risk']}")
-                        if "dependencies" in visible_keys and biz.get("dependencies"):
-                            st.markdown("**Zależności:**")
-                            for dep in biz["dependencies"]:
-                                st.markdown(f"- {dep}")
-                        feas = item.get("feasibility")
-                        if "feasibility" in visible_keys and feas:
-                            vicon = {"Tak": "🟢", "Z zastrzeżeniami": "🟡", "Nie": "🔴"}.get(feas.get("verdict", ""), "🟡")
-                            st.markdown(f"**Wykonalność:** {vicon} {feas.get('verdict', '')} — {feas.get('reason', '')}")
-                            if feas.get("impacted_services"):
-                                st.caption("Serwisy: " + ", ".join(feas["impacted_services"]))
-                            if feas.get("impacted_files"):
-                                st.caption("Pliki: " + ", ".join(feas["impacted_files"]))
-                        tp = item.get("test_plan")
-                        if "test_plan" in visible_keys and tp:
-                            st.markdown("**Plan testów:**")
-                            for t in tp.get("existing", []):
-                                st.markdown(f"- ✅ (istnieje) {t}")
-                            for t in tp.get("new", []):
-                                st.markdown(f"- ➕ (nowy) {t}")
+                        icon = "🔴" if biz.get("impact") == "Wysoki" else "🟡"
+                        c1.markdown(f"**Impact:** {icon} {biz.get('impact', '—')}  \n"
+                                    f"**Obszar:** {biz.get('area', '—')}")
+                        ricon = "🔴" if "Wysoki" in biz.get("risk", "") else "🟡"
+                        c2.markdown(f"**Ryzyko:** {ricon} {biz.get('risk', '—')}")
+                        if biz.get("summary"):
+                            st.markdown(biz["summary"])
+                        if biz.get("dependencies"):
+                            st.markdown("**Zależności:** " + ", ".join(biz["dependencies"]))
                     else:
                         st.markdown(item["answer"])
-                else:
-                    tech_visible = {
-                        f["key"] for f in st.session_state.answer_templates.get("technical", [])
-                        if f["visible"]
-                    }
-                    if "answer_text" in tech_visible:
-                        st.markdown(item["answer"])
-                    if chunks_item and ("file_path" in tech_visible or "source_code" in tech_visible):
-                        with st.expander("📎 Źródła"):
-                            for c in chunks_item:
-                                abs_path = os.path.join(
-                                    st.session_state.get("repo_path", ""), c.file_path
-                                )
-                                if "file_path" in tech_visible:
-                                    st.code(f"{abs_path}:{c.start_line}", language=None)
-                                if "source_code" in tech_visible:
-                                    lang = _lang_for(c.file_path)
-                                    st.code(
-                                        f"# {c.file_path}:{c.start_line}–{c.end_line}  ({c.symbol})\n{c.source}",
-                                        language=lang,
-                                    )
 
-                # ── SEKCJA: Propozycje rozwiązania ───────────────────────────
+                with tab_feas:
+                    if feas:
+                        vicon = {"Tak": "🟢", "Z zastrzeżeniami": "🟡", "Nie": "🔴"}.get(feas.get("verdict", ""), "🟡")
+                        st.markdown(f"**{vicon} {feas.get('verdict', '—')}** — {feas.get('reason', '')}")
+                        if feas.get("impacted_services"):
+                            st.markdown("**Serwisy:** " + ", ".join(feas["impacted_services"]))
+                        if feas.get("impacted_files"):
+                            st.markdown("**Pliki:**")
+                            for f in feas["impacted_files"]:
+                                st.markdown(f"- `{f}`")
+                    else:
+                        st.caption("Brak oceny wykonalności.")
+
+                with tab_test:
+                    if tp and (tp.get("existing") or tp.get("new")):
+                        for t in tp.get("existing", []):
+                            st.markdown(f"- ✅ (istnieje) {t}")
+                        for t in tp.get("new", []):
+                            st.markdown(f"- ➕ (nowy) {t}")
+                    else:
+                        st.caption("Brak planu testów.")
+
+                with tab_src:
+                    st.markdown(item["answer"])
+                    if chunks_item:
+                        st.divider()
+                        for c in chunks_item:
+                            display_path = f"{c.repo}/{c.file_path}" if c.repo else c.file_path
+                            st.code(
+                                f"# {display_path}:{c.start_line}–{c.end_line}  ({c.symbol})\n{c.source}",
+                                language=_lang_for(c.file_path),
+                            )
+
+                # ── Rekomendacja (jedna, wybrana przez LLM) ──────────────────
                 if proposals:
                     st.markdown("---")
-                    st.markdown("#### Propozycje rozwiązania")
+                    rec_idx = item.get("recommended_index")
+                    if not isinstance(rec_idx, int) or not (0 <= rec_idx < len(proposals)):
+                        rec_idx = 0
+                    rec = proposals[rec_idx]
                     accepted_indices = item.get("accepted_proposal_indices")
 
-                    if accepted_indices is None:
-                        for j, p in enumerate(proposals):
-                            effort_icon = "🟢" if p["effort"] == "Bardzo niski" else ("🟡" if p["effort"] == "Niski" else "🔴")
-                            risk_icon = "🔴" if "Wysoki" in p["risk"] else ("🟢" if "Niski" in p["risk"] else "🟡")
-                            checked = st.checkbox(
-                                f"**{p['title']}**",
-                                key=f"prop_check_{i}_{j}",
-                            )
-                            if checked:
-                                with st.container():
-                                    st.markdown(
-                                        f"<div style='margin-left:28px;margin-bottom:6px'>"
-                                        f"{p['description']}<br/>"
-                                        f"<span style='font-size:12px;color:#888'>"
-                                        f"Nakład: {effort_icon} {p['effort']} &nbsp;·&nbsp; "
-                                        f"Ryzyko: {risk_icon} {p['risk']}</span></div>",
-                                        unsafe_allow_html=True,
-                                    )
+                    effort_icon = "🟢" if rec["effort"] == "Bardzo niski" else ("🟡" if rec["effort"] == "Niski" else "🔴")
+                    risk_icon = "🔴" if "Wysoki" in rec["risk"] else ("🟢" if "Niski" in rec["risk"] else "🟡")
 
-                        selected_indices = [
-                            j for j in range(len(proposals))
-                            if st.session_state.get(f"prop_check_{i}_{j}", False)
-                        ]
-                        if st.button(
-                            "✅ Akceptuj wybrane propozycje",
-                            key=f"accept_{i}",
-                            type="primary",
-                            disabled=len(selected_indices) == 0,
+                    if accepted_indices is None:
+                        st.markdown("**💡 Rekomendowane rozwiązanie**")
+                        st.markdown(
+                            f"<div style='background:#f0fdf4;border-left:4px solid #22c55e;"
+                            f"padding:10px 16px;border-radius:4px;margin-bottom:8px'>"
+                            f"<b>{rec['title']}</b><br/>"
+                            f"<span style='color:#555;font-size:13px'>{rec['description']}</span><br/>"
+                            f"<span style='font-size:12px;color:#888'>Nakład: {effort_icon} {rec['effort']} "
+                            f"&nbsp;·&nbsp; Ryzyko: {risk_icon} {rec['risk']}</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                        if item.get("recommended_reason"):
+                            st.caption(f"Dlaczego ta opcja: {item['recommended_reason']}")
+                        others = [(k, p) for k, p in enumerate(proposals) if k != rec_idx]
+                        if others:
+                            with st.expander(f"Rozważane alternatywy ({len(others)})"):
+                                for _, p in others:
+                                    st.markdown(f"- **{p['title']}** — {p['description']}")
+
+                        # Uwagi już uwzględnione w tej rekomendacji (jeśli były iteracje).
+                        prior_refinements = item.get("refinements", [])
+                        if prior_refinements:
+                            with st.expander(f"🗣 Uwzględnione uwagi ({len(prior_refinements)})"):
+                                for r in prior_refinements:
+                                    st.markdown(f"- {r}")
+
+                        # ── Doprecyzowanie: użytkownik dodaje uwagi → nowa rekomendacja ──
+                        with st.expander("✍️ Doprecyzuj — poproś o nową rekomendację"):
+                            note = st.text_area(
+                                "Uwagi do uwzględnienia",
+                                placeholder=(
+                                    "np. nie chcę nowej klasy bazowej — wolę zmianę lokalnie w każdym serwisie\n"
+                                    "    uwzględnij że logowanie musi być na poziomie INFO i bez danych wrażliwych"
+                                ),
+                                height=80,
+                                key=f"refine_note_{i}",
+                                label_visibility="collapsed",
+                            )
+                            if st.button(
+                                "🔄 Wygeneruj nową rekomendację z uwagami",
+                                key=f"regen_{i}", use_container_width=True,
+                                disabled=not note.strip(),
+                            ):
+                                item.setdefault("refinements", []).append(note.strip())
+                                refinements_txt = "\n".join(f"- {r}" for r in item["refinements"])
+                                augmented = (
+                                    f"{item['question']}\n\n"
+                                    f"UWAGI UŻYTKOWNIKA DO UWZGLĘDNIENIA (doprecyzowanie wcześniejszej "
+                                    f"rekomendacji — potraktuj je jako twarde wymagania):\n{refinements_txt}\n\n"
+                                    f"Wygeneruj zaktualizowaną analizę i JEDNĄ rekomendację, "
+                                    f"uwzględniając powyższe uwagi."
+                                )
+                                with st.spinner("Generuję nową rekomendację z uwzględnieniem uwag…"):
+                                    new_result = run_qa(augmented, chunks=st.session_state.chunks)
+                                _log_question(augmented, new_result, st.session_state.get("active_app_id"))
+                                item["answer"] = new_result["answer"]
+                                item["chunks"] = new_result["retrieved_chunks"]
+                                item["business_context"] = new_result.get("business_context")
+                                item["feasibility"] = new_result.get("feasibility")
+                                item["test_plan"] = new_result.get("test_plan")
+                                item["proposals"] = new_result.get("proposals", [])
+                                item["recommended_index"] = new_result.get("recommended_index")
+                                item["recommended_reason"] = new_result.get("recommended_reason")
+                                item["accepted_proposal_indices"] = None
+                                st.rerun()
+
+                        if chunks_item and st.button(
+                            "✅ Akceptuj rekomendację i przejdź dalej",
+                            key=f"accept_{i}", type="primary", use_container_width=True,
                         ):
-                            item["accepted_proposal_indices"] = selected_indices
-                            item["accepted_commit_hints"] = [proposals[j]["commit_hint"] for j in selected_indices]
-                            st.rerun()
+                            item["accepted_proposal_indices"] = [rec_idx]
+                            item["accepted_commit_hints"] = [rec["commit_hint"]]
+                            st.session_state.sandbox_preload_symbol = chunks_item[0].symbol
+                            st.session_state.sandbox_accepted_proposals = [rec]
+                            st.session_state.sandbox_question = item["question"]
+                            st.session_state.sandbox_generated_code = None
+                            st.session_state.sandbox_code_version = 0
+                            st.session_state.sandbox_diff = None
+                            st.session_state.sandbox_newfile = None
+                            st.session_state.sandbox_error = None
+                            st.session_state.sandbox_chunks = chunks_item
+                            st.session_state.sandbox_preload_chunks = chunks_item
+                            st.session_state.sandbox_multi_changes = None
+                            st.session_state.sandbox_plan = None
+                            _advance()
                     else:
                         for j in accepted_indices:
-                            p = proposals[j]
-                            st.success(f"✅ {p['title']}")
-                        st.caption(f"Sugerowane commity: {len(accepted_indices)}")
-
-                        if chunks_item:
-                            if st.button("Przejdź dalej →", key=f"next_{i}", type="primary"):
-                                st.session_state.sandbox_preload_symbol = chunks_item[0].symbol
-                                st.session_state.sandbox_accepted_proposals = [
-                                    proposals[j] for j in accepted_indices
-                                ]
-                                st.session_state.sandbox_question = item["question"]
-                                st.session_state.sandbox_generated_code = None
-                                st.session_state.sandbox_code_version = 0
-                                st.session_state.sandbox_diff = None
-                                st.session_state.sandbox_newfile = None
-                                st.session_state.sandbox_error = None
-                                st.session_state.sandbox_chunks = chunks_item
-                                _advance()
+                            st.success(f"✅ {proposals[j]['title']}")
+                        if chunks_item and st.button("Przejdź dalej →", key=f"next_{i}", type="primary"):
+                            st.session_state.sandbox_preload_symbol = chunks_item[0].symbol
+                            st.session_state.sandbox_accepted_proposals = [
+                                proposals[j] for j in accepted_indices
+                            ]
+                            st.session_state.sandbox_question = item["question"]
+                            st.session_state.sandbox_generated_code = None
+                            st.session_state.sandbox_code_version = 0
+                            st.session_state.sandbox_diff = None
+                            st.session_state.sandbox_newfile = None
+                            st.session_state.sandbox_error = None
+                            st.session_state.sandbox_chunks = chunks_item
+                            st.session_state.sandbox_preload_chunks = chunks_item
+                            st.session_state.sandbox_multi_changes = None
+                            st.session_state.sandbox_plan = None
+                            _advance()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -572,19 +676,8 @@ elif active_tab == "sandbox":
                 st.warning(f"Nie znaleziono funkcji '{symbol}' w zaindeksowanym kodzie.")
             else:
                 # ── Ścieżka serwisu sklepu (Java/JS/TS/…): pełny plik → diff (git) → PR → bramka ──
-                # Wszystko poza .py (legacy sample) idzie tą ścieżką: Java, JSX/TSX front-endu itd.
+                # Obsługuje zarówno single-repo jak i multi-repo (wszystkie chunki z wyników wyszukiwania).
                 if not chunk.file_path.endswith(".py"):
-                    repo_path = st.session_state.get("repo_path", "")
-                    service = os.path.basename(os.path.normpath(repo_path))
-                    repo_slug = f"ai-bot-playground/{service}"
-                    target_rel = chunk.file_path
-                    target_abs = os.path.join(repo_path, target_rel)
-                    try:
-                        with open(target_abs, encoding="utf-8") as _f:
-                            original = _f.read()
-                    except OSError:
-                        original = chunk.source
-
                     if question:
                         st.markdown(
                             f"<div style='background:#f0f4ff;border-left:4px solid #6366f1;"
@@ -595,73 +688,246 @@ elif active_tab == "sandbox":
                         )
                     for p in accepted_proposals:
                         st.caption(f"✅ {p['title']} — {p['description']}")
-                    st.caption(f"Plik docelowy: `{target_rel}` · PR → **{repo_slug}** (base `main`)")
 
-                    if st.session_state.get("sandbox_newfile") is None:
-                        with st.spinner("Agent generuje zmianę (pełna treść pliku)…"):
-                            try:
-                                st.session_state.sandbox_newfile = generate_file_change(
-                                    question, accepted_proposals, target_rel, original,
-                                )
-                                st.session_state.sandbox_error = None
-                            except Exception as exc:  # noqa: BLE001 — pokaż realny błąd w UI
-                                st.session_state.sandbox_newfile = ""
-                                st.session_state.sandbox_error = str(exc)
+                    repo_paths = st.session_state.get("repo_paths", {})
+
+                    # ── Krok planowania: LLM wskazuje pliki do zmiany/utworzenia w CAŁEJ aplikacji
+                    # (na bazie mapy wszystkich repo), zamiast ślepego top-5 z retrievalu. ──
+                    if st.session_state.get("sandbox_plan") is None:
+                        with st.spinner("Planuję zmianę w całej aplikacji (które pliki zmienić/utworzyć)…"):
+                            repo_map = build_repo_map(st.session_state.get("chunks", []))
+                            st.session_state.sandbox_plan = plan_change(
+                                question, repo_map, accepted_proposals
+                            )
                         st.rerun()
 
-                    new_content = st.session_state.sandbox_newfile or ""
-                    sandbox_error = st.session_state.get("sandbox_error")
-                    if sandbox_error:
-                        st.error(
-                            f"Wywołanie LLM nie powiodło się: {sandbox_error}\n\n"
-                            "To nie jest brak klucza API. Jeśli to błąd certyfikatu "
-                            "(`CERTIFICATE_VERIFY_FAILED`), to przejściowy problem korporacyjnego "
-                            "proxy — ponów próbę."
-                        )
-                    elif not new_content.strip():
-                        if is_demo_mode():
-                            st.info(
-                                "Brak zmiany — tryb demo (bez `OPENROUTER_API_KEY`/`AZURE_ANTHROPIC_API_KEY`). "
-                                "Podłącz klucz API."
+                    plan = st.session_state.get("sandbox_plan") or []
+                    seen_keys: set = set()
+                    targets: list[dict] = []
+                    for pf in plan:
+                        repo, path, action = pf["repo"], pf["path"], pf["action"]
+                        if repo not in repo_paths or path.endswith(".py"):
+                            continue
+                        if (repo, path) in seen_keys:
+                            continue
+                        seen_keys.add((repo, path))
+                        rpath = repo_paths[repo]
+                        orig = ""
+                        if action == "modify":
+                            try:
+                                with open(os.path.join(rpath, path), encoding="utf-8") as _f:
+                                    orig = _f.read()
+                            except OSError:
+                                action = "create"  # plik z planu nie istnieje → utwórz
+                        targets.append({
+                            "repo": repo, "file_path": path, "action": action,
+                            "original": orig, "repo_path": rpath,
+                            "reason": pf.get("reason", ""),
+                        })
+
+                    # Fallback: planner nic nie zwrócił → użyj plików z retrievalu (stare zachowanie).
+                    if not targets:
+                        st.warning("Planner nie zwrócił plików — używam wyników wyszukiwania jako kandydatów.")
+                        for c in (st.session_state.get("sandbox_preload_chunks") or [chunk]):
+                            if c.file_path.endswith(".py") or c.repo not in repo_paths:
+                                continue
+                            if (c.repo, c.file_path) in seen_keys:
+                                continue
+                            seen_keys.add((c.repo, c.file_path))
+                            rpath = repo_paths.get(c.repo, "")
+                            try:
+                                with open(os.path.join(rpath, c.file_path), encoding="utf-8") as _f:
+                                    orig = _f.read()
+                            except OSError:
+                                orig = c.source
+                            targets.append({"repo": c.repo, "file_path": c.file_path, "action": "modify",
+                                             "original": orig, "repo_path": rpath, "reason": ""})
+
+                    n_repos = len({t["repo"] for t in targets})
+                    n_files = len(targets)
+                    n_new = sum(1 for t in targets if t["action"] == "create")
+                    st.caption(
+                        f"Plan: {n_files} plik(ów) w {n_repos} repo · {n_new} nowych · base `main`"
+                    )
+                    with st.expander("📋 Plan zmian", expanded=True):
+                        if not targets:
+                            st.info("Brak plików do zmiany.")
+                        for t in targets:
+                            tag = "🆕 utwórz" if t["action"] == "create" else "✏️ zmień"
+                            st.markdown(
+                                f"- {tag} `{t['repo']}/{t['file_path']}`"
+                                + (f" — {t['reason']}" if t.get("reason") else "")
                             )
-                        else:
-                            st.warning(
-                                "Model zwrócił pustą treść — najczęściej wskazany plik nie pasuje do "
-                                f"zmiany. Wybrano `{target_rel}` w serwisie **{service}**; jeśli chcesz "
-                                "zmienić inny serwis (np. shop-ui), zaindeksuj go w panelu bocznym i ponów."
-                            )
-                    else:
-                        diff_preview = compute_diff(original, new_content, target_rel)
-                        if not diff_preview.strip():
-                            st.warning("Wygenerowana treść jest identyczna z oryginałem (brak zmian).")
-                        else:
-                            st.markdown("**Podgląd zmian (diff liczony przez git):**")
-                            st.code(diff_preview, language="diff")
-                        with st.expander("Pełna nowa treść pliku"):
-                            st.code(new_content, language=_lang_for(target_rel))
-                        default_title = (
-                            accepted_proposals[0].get("commit_hint")
-                            if accepted_proposals else f"change: {service}"
-                        )
-                        pr_title = st.text_input("Tytuł PR / commit", value=default_title or f"change: {service}")
-                        can_pr = bool(diff_preview.strip())
-                        if st.button("🚀 Wystaw PR do serwisu", type="primary",
-                                     disabled=not can_pr, use_container_width=True):
-                            with st.spinner("Tworzę czystą gałąź (git worktree), zapisuję plik, wypycham i otwieram PR…"):
-                                res = open_pr_for_file_change(
-                                    target_rel, new_content, pr_title.strip() or f"change: {service}",
-                                    "PR wygenerowany przez shop-qa-ui. Walidacja: bramka preprod-gate.",
-                                    repo_slug, local_repo=repo_path,
-                                )
-                            if res.get("success"):
-                                st.session_state.sandbox_commit_done = res.get("branch", "branch")
-                                st.session_state.qa_repo_slug = repo_slug
-                                st.session_state.qa_pr_branch = res.get("branch", "")
-                                st.session_state.qa_pr_url = res.get("pr_url", "")
-                                st.session_state.qa_pr_warning = res.get("warning", "")
-                                _advance()
+
+                    # Inicjuj lub przywróć stan zmian per-plik.
+                    if st.session_state.get("sandbox_multi_changes") is None:
+                        st.session_state.sandbox_multi_changes = [
+                            {**t, "new_content": None, "diff": None, "error": None, "pr_result": None}
+                            for t in targets
+                        ]
+                        st.session_state.sandbox_test_results = {}  # nowe zmiany → testy nieaktualne
+                    multi = st.session_state.sandbox_multi_changes
+
+                    # Generuj zmiany dla plików bez wygenerowanej treści.
+                    to_gen = [mc for mc in multi if mc["new_content"] is None]
+                    if to_gen:
+                        with st.spinner(f"Generuję zmiany dla {len(to_gen)}/{len(multi)} pliku/plików…"):
+                            for mc in to_gen:
+                                try:
+                                    if mc.get("action") == "create":
+                                        gen = generate_new_file(
+                                            question, accepted_proposals,
+                                            mc["repo"], mc["file_path"],
+                                        ) or ""
+                                    else:
+                                        gen = generate_file_change(
+                                            question, accepted_proposals,
+                                            mc["file_path"], mc["original"],
+                                        ) or ""
+                                    mc["new_content"] = gen
+                                    # Pusta treść z modelu = BRAK zmiany, nie usunięcie pliku.
+                                    # Bez tego compute_diff(original, "") dałby diff kasujący
+                                    # cały plik i trafiłby do PR-a.
+                                    mc["diff"] = (
+                                        compute_diff(mc["original"], gen, mc["file_path"])
+                                        if gen.strip() else ""
+                                    )
+                                    mc["error"] = None
+                                except Exception as exc:
+                                    mc["new_content"] = ""
+                                    mc["diff"] = ""
+                                    mc["error"] = str(exc)
+                        st.rerun()
+
+                    # Pokaż diff per-plik.
+                    has_any_diff = any((mc.get("diff") or "").strip() for mc in multi)
+                    for mc in multi:
+                        diff_str = mc.get("diff") or ""
+                        tag = "🆕 " if mc.get("action") == "create" else ""
+                        label = f"{tag}`{mc['repo']}/{mc['file_path']}`"
+                        with st.expander(label, expanded=bool(diff_str.strip())):
+                            if mc.get("error"):
+                                st.error(f"Błąd LLM: {mc['error']}")
+                            elif not (mc.get("new_content") or "").strip():
+                                if is_demo_mode():
+                                    st.info("Tryb demo — podłącz klucz API, aby wygenerować zmianę.")
+                                else:
+                                    st.warning(
+                                        f"Model zwrócił pustą treść dla `{mc['file_path']}` "
+                                        f"(serwis **{mc['repo']}**)."
+                                    )
+                            elif not diff_str.strip():
+                                st.warning("Wygenerowana treść identyczna z oryginałem (brak zmian).")
                             else:
-                                st.error(f"Nie udało się wystawić PR: {res.get('error')}")
+                                st.code(diff_str, language="diff")
+                                with st.expander("Pełna nowa treść"):
+                                    st.code(mc["new_content"], language=_lang_for(mc["file_path"]))
+
+                    # Status PR per-repo (już wystawionych).
+                    done_prs = [mc for mc in multi if mc.get("pr_result") is not None]
+                    for mc in done_prs:
+                        pr = mc["pr_result"]
+                        if pr.get("success"):
+                            st.success(f"✅ PR otwarty — `{mc['repo']}`: {pr.get('pr_url', '')}")
+                        elif pr.get("warning"):
+                            st.warning(f"⚠️ `{mc['repo']}`: {pr['warning']}")
+                        else:
+                            st.error(f"❌ `{mc['repo']}`: {pr.get('error', 'nieznany błąd')}")
+
+                    # ── Bramka: gradle test per serwis PRZED wystawieniem PR ──
+                    changed = [mc for mc in multi if (mc.get("diff") or "").strip()]
+                    affected_repos: dict = {}
+                    for mc in changed:
+                        ar = affected_repos.setdefault(
+                            mc["repo"], {"repo_path": mc["repo_path"], "files": []}
+                        )
+                        ar["files"].append((mc["file_path"], mc["new_content"]))
+
+                    test_results = st.session_state.setdefault("sandbox_test_results", {})
+                    if changed:
+                        st.markdown("---")
+                        st.markdown("**🧪 Testy serwisów (gradle test) — opcjonalnie**")
+                        st.caption(
+                            "Pełne testy (Cucumber + Testcontainers) na czystym worktree z "
+                            "`origin/main` + Twoja zmiana. Opcjonalne — autorytatywna bramka "
+                            "`preprod-gate` i tak odpali się w CI po wystawieniu PR."
+                        )
+                        if st.button("▶ Uruchom testy (opcjonalnie)", use_container_width=True):
+                            for repo, info in affected_repos.items():
+                                with st.spinner(f"gradle test — {repo}… (to może potrwać minuty)"):
+                                    test_results[repo] = run_service_tests(
+                                        info["repo_path"], info["files"]
+                                    )
+                            st.session_state.sandbox_test_results = test_results
+                            st.rerun()
+
+                        for repo in affected_repos:
+                            res = test_results.get(repo)
+                            dur = f"{res.get('duration_s', '?')}s" if res else ""
+                            if not res:
+                                st.markdown(f"⏳ **{repo}** — testy nieuruchomione")
+                            elif res.get("success"):
+                                st.success(f"✅ {repo} — {res.get('summary', 'OK')}  ({dur})")
+                            else:
+                                st.error(
+                                    f"❌ {repo} — {res.get('summary') or res.get('error', 'niepowodzenie')}  ({dur})"
+                                )
+                                if res.get("tail"):
+                                    with st.expander(f"Log — {repo}"):
+                                        st.code(res["tail"], language=None)
+
+                    # Przycisk wystawiania PRów — testy lokalne NIE blokują (walidacja w CI).
+                    pending = [
+                        mc for mc in multi
+                        if mc.get("pr_result") is None and (mc.get("diff") or "").strip()
+                    ]
+                    if pending and has_any_diff:
+                        default_title = (
+                            accepted_proposals[0].get("commit_hint") if accepted_proposals
+                            else f"change: {len(pending)} serwisów"
+                        )
+                        pr_title = st.text_input("Tytuł PR / commit", value=default_title or "change")
+                        n_p = len(pending)
+                        st.caption("Walidacja testowa wykona się w CI (`preprod-gate`) po utworzeniu PR.")
+                        if st.button(
+                            f"🚀 Wystaw {'PR' if n_p == 1 else f'{n_p} PRy/PRów'} "
+                            f"({n_p} {'repozytorium' if n_p == 1 else 'repozytoria/repozytoriów'})",
+                            type="primary", use_container_width=True,
+                        ):
+                            with st.spinner(f"Wystawiam {n_p} PR-ów…"):
+                                for mc in pending:
+                                    rs = open_pr_for_file_change(
+                                        mc["file_path"], mc["new_content"],
+                                        pr_title.strip() or f"change: {mc['repo']}",
+                                        "PR wygenerowany przez shop-qa-ui. Walidacja: bramka preprod-gate.",
+                                        f"ai-bot-playground/{mc['repo']}",
+                                        local_repo=mc["repo_path"],
+                                        allow_create=(mc.get("action") == "create"),
+                                    )
+                                    mc["pr_result"] = rs
+                            all_attempted = all(
+                                mc.get("pr_result") is not None
+                                for mc in multi if (mc.get("diff") or "").strip()
+                            )
+                            if all_attempted:
+                                st.session_state.sandbox_commit_done = "multi"
+                                st.session_state.qa_multi_prs = [
+                                    {
+                                        "repo": mc["repo"],
+                                        "repo_slug": f"ai-bot-playground/{mc['repo']}",
+                                        "pr_url": (mc.get("pr_result") or {}).get("pr_url", ""),
+                                        "branch": (mc.get("pr_result") or {}).get("branch", ""),
+                                        "success": (mc.get("pr_result") or {}).get("success", False),
+                                        "error": (mc.get("pr_result") or {}).get("error", ""),
+                                        "warning": (mc.get("pr_result") or {}).get("warning", ""),
+                                    }
+                                    for mc in multi if (mc.get("diff") or "").strip()
+                                ]
+                                _advance()
+                            st.rerun()
+                    elif not pending and done_prs:
+                        if st.button("Przejdź dalej → PR", type="primary"):
+                            _advance()
                     st.stop()
 
                 # ── Ścieżka Python (sample/legacy) ────────────────────────────
@@ -797,7 +1063,9 @@ elif active_tab == "sandbox":
                         )
                         if commit_clicked and commit_msg.strip():
                             edited = st.session_state.get("sandbox_edited_code", chunk.source)
-                            repo_path = st.session_state.get("repo_path", "")
+                            repo_path = st.session_state.get("repo_paths", {}).get(
+                                chunk.repo, st.session_state.get("repo_path", "")
+                            )
                             with st.spinner("Zapisuję zmianę, commituję i wypycham branch…"):
                                 abs_path = replace_function_in_file(chunk, edited, repo_path)
                                 res = commit_and_push_change(abs_path, commit_msg.strip(), repo_path)
@@ -823,6 +1091,28 @@ elif active_tab == "sandbox":
 # ═══════════════════════════════════════════════════════════════════════════════
 elif active_tab == "pr":
     st.title("Pull Request")
+
+    # ── Ścieżka multi-repo (wiele PRów cross-repo) ──
+    if st.session_state.get("qa_multi_prs"):
+        multi_prs = st.session_state.qa_multi_prs
+        successful = [pr for pr in multi_prs if pr["success"]]
+        n_repos = len({pr["repo"] for pr in multi_prs})
+        st.markdown(f"### {len(multi_prs)} Pull Requestów w {n_repos} repozytoriach")
+        st.markdown(f"**{len(successful)}/{len(multi_prs)}** otwartych pomyślnie.")
+        for pr in multi_prs:
+            icon = "✅" if pr["success"] else ("⚠️" if pr.get("warning") else "❌")
+            with st.expander(f"{icon} `{pr['repo_slug']}`", expanded=not pr["success"]):
+                if pr["success"]:
+                    st.success(f"PR otwarty: {pr['pr_url']}")
+                    if pr["pr_url"]:
+                        st.link_button("Otwórz PR na GitHub", pr["pr_url"], use_container_width=True)
+                    st.caption(f"Gałąź: `{pr['branch']}` · wymagany check **preprod-gate**")
+                elif pr.get("warning"):
+                    st.warning(pr["warning"])
+                    st.caption(f"Gałąź: `{pr['branch']}`")
+                else:
+                    st.error(f"Błąd: {pr['error']}")
+        st.stop()
 
     # ── Ścieżka Java (serwis sklepu): PR + status bramki preprod + merge ──
     if st.session_state.get("qa_repo_slug"):

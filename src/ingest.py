@@ -11,6 +11,7 @@ class CodeChunk:
     start_line: int
     end_line: int
     source: str
+    repo: str = ""   # nazwa repozytorium (puste dla sample/legacy)
 
 
 # Directories never worth indexing (build output, VCS, deps).
@@ -237,12 +238,29 @@ _PARSERS = {
 }
 
 
-def ingest_repo(repo_path: str) -> list[CodeChunk]:
+def ingest_repo(repo_path: str, repo_name: str = "") -> list[CodeChunk]:
     root = Path(repo_path).resolve()
     chunks: list[CodeChunk] = []
     for suffix, parser in _PARSERS.items():
         for f in root.rglob(f"*{suffix}"):
             if any(part in _SKIP_DIRS for part in f.parts):
                 continue
-            chunks.extend(parser(f, root))
+            for chunk in parser(f, root):
+                chunk.repo = repo_name
+                chunks.append(chunk)
+    return chunks
+
+
+def ingest_app(repos: list[dict]) -> list[CodeChunk]:
+    """Indeksuje wiele repozytoriów naraz i taguje każdy chunk nazwą repo.
+
+    Każdy element `repos` to słownik z kluczami `name` (str) i `path` (str).
+    Pomija repo, których katalog nie istnieje.
+    """
+    chunks: list[CodeChunk] = []
+    for repo in repos:
+        name, path = repo["name"], repo["path"]
+        if not Path(path).is_dir():
+            continue
+        chunks.extend(ingest_repo(path, repo_name=name))
     return chunks

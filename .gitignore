@@ -20,3 +20,6 @@ ci_report.md
 
 # Logi uruchomieniowe (np. tryb demo)
 streamlit.log
+
+# Trwała historia pytań użytkownika (może zawierać wrażliwe treści)
+logs/
