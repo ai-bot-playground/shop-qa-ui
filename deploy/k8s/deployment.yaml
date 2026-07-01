@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: shop-qa-ui
-  namespace: shop-qa-ui
+  namespace: shop
   labels:
     app.kubernetes.io/name: shop-qa-ui
 spec:
@@ -19,7 +19,7 @@ spec:
       containers:
         - name: app
           # Podmień na swój rejestr (np. ACR: myregistry.azurecr.io/shop-qa-ui:TAG)
-          image: shop-qa-ui:dev
+          image: localhost/shop-qa-ui:dev
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
