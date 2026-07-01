@@ -2,8 +2,7 @@
 # Build: podman build -t shop-qa-ui:dev -f Containerfile .
 #   (działa też z `docker build`; plik jest zgodny z OCI/Dockerfile)
 #
-# Obraz pakuje monolit Streamlit (app.py + src/*). Dopóki app.py nie istnieje,
-# entrypoint uruchamia placeholder — patrz docker/entrypoint.sh.
+# Obraz pakuje monolit Streamlit (app.py + src/*) — patrz docker/entrypoint.sh.
 
 FROM python:3.12-slim
 

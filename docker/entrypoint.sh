@@ -1,7 +1,5 @@
 #!/usr/bin/env sh
-# entrypoint.sh — uruchamia aplikację Streamlit, a dopóki kod nie jest wpięty,
-# pokazuje stronę-placeholder. To czyni szkielet uruchamialnym od pierwszego dnia,
-# zanim instancje T1–T5 dostarczą app.py / src/*.
+# entrypoint.sh — uruchamia aplikację Streamlit.
 set -e
 
 APP="${APP_ENTRYPOINT:-app.py}"
@@ -12,12 +10,11 @@ STREAMLIT_FLAGS="--server.port=${PORT} \
   --server.headless=true \
   --browser.gatherUsageStats=false"
 
-if [ -f "$APP" ]; then
-  echo "[entrypoint] Uruchamiam aplikację: $APP"
-  # shellcheck disable=SC2086
-  exec streamlit run "$APP" $STREAMLIT_FLAGS
-else
-  echo "[entrypoint] Nie znaleziono '$APP' — uruchamiam placeholder (czekam na kod aplikacji)."
-  # shellcheck disable=SC2086
-  exec streamlit run /app/docker/placeholder_app.py $STREAMLIT_FLAGS
+if [ ! -f "$APP" ]; then
+  echo "[entrypoint] BŁĄD: nie znaleziono '$APP'." >&2
+  exit 1
 fi
+
+echo "[entrypoint] Uruchamiam aplikację: $APP"
+# shellcheck disable=SC2086
+exec streamlit run "$APP" $STREAMLIT_FLAGS

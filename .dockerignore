@@ -6,8 +6,7 @@
 .git
 .gitignore
 
-# Wirtualne środowiska / podprojekty testowe
-test-endpoint/.venv
+# Wirtualne środowiska
 **/.venv
 **/venv
 .venv
