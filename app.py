@@ -15,7 +15,7 @@ from src.agent import (
     verify_completeness,
 )
 from src.sandbox import (
-    compute_diff, open_pr_for_files, pr_checks, merge_pr, run_service_tests,
+    compute_diff, open_pr_for_files, pr_checks, merge_pr,
     pr_failure_summary,
 )
 from src.answer_types import ANSWER_TYPES, get_default_templates
@@ -204,8 +204,7 @@ def _load_app_options():
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### 🔍 Analizator Kodu")
-    st.caption("Wiedza plemienna — odblokowana")
+    st.markdown("### Feature to Prod")
     st.divider()
 
     # Indeksowanie — selektor aplikacji z manifest.yaml. Wybranie aplikacji
@@ -927,48 +926,6 @@ elif active_tab == "sandbox":
                             st.warning(f"⚠️ `{mc['repo']}`: {pr['warning']}")
                         else:
                             st.error(f"❌ `{mc['repo']}`: {pr.get('error', 'nieznany błąd')}")
-
-                    # ── Bramka: gradle test per serwis PRZED wystawieniem PR ──
-                    changed = [mc for mc in multi if (mc.get("diff") or "").strip()]
-                    affected_repos: dict = {}
-                    for mc in changed:
-                        ar = affected_repos.setdefault(
-                            mc["repo"], {"repo_path": mc["repo_path"], "files": []}
-                        )
-                        ar["files"].append((mc["file_path"], mc["new_content"]))
-
-                    test_results = st.session_state.setdefault("sandbox_test_results", {})
-                    if changed:
-                        st.markdown("---")
-                        st.markdown("**🧪 Testy serwisów (gradle test) — opcjonalnie**")
-                        st.caption(
-                            "Pełne testy (Cucumber + Testcontainers) na czystym worktree z "
-                            "`origin/main` + Twoja zmiana. Opcjonalne — autorytatywna bramka "
-                            "`preprod-gate` i tak odpali się w CI po wystawieniu PR."
-                        )
-                        if st.button("▶ Uruchom testy (opcjonalnie)", use_container_width=True):
-                            for repo, info in affected_repos.items():
-                                with st.spinner(f"gradle test — {repo}… (to może potrwać minuty)"):
-                                    test_results[repo] = run_service_tests(
-                                        info["repo_path"], info["files"]
-                                    )
-                            st.session_state.sandbox_test_results = test_results
-                            st.rerun()
-
-                        for repo in affected_repos:
-                            res = test_results.get(repo)
-                            dur = f"{res.get('duration_s', '?')}s" if res else ""
-                            if not res:
-                                st.markdown(f"⏳ **{repo}** — testy nieuruchomione")
-                            elif res.get("success"):
-                                st.success(f"✅ {repo} — {res.get('summary', 'OK')}  ({dur})")
-                            else:
-                                st.error(
-                                    f"❌ {repo} — {res.get('summary') or res.get('error', 'niepowodzenie')}  ({dur})"
-                                )
-                                if res.get("tail"):
-                                    with st.expander(f"Log — {repo}"):
-                                        st.code(res["tail"], language=None)
 
                     # Przycisk wystawiania PRów — testy lokalne NIE blokują (walidacja w CI).
                     pending = [
