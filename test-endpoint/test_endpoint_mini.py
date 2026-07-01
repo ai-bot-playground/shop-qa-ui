@@ -2,8 +2,9 @@ import os
 import requests
 import json
 
-ENDPOINT = "https://ai-remik.services.ai.azure.com/openai/v1/responses"
-API_KEY = os.environ["AZURE_OPENAI_API_KEY"]  # ustaw w env
+ENDPOINT = os.environ.get("OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1/chat/completions")
+MODEL = os.environ.get("OPENROUTER_MODEL", "z-ai/glm-5.2")
+API_KEY = os.environ["OPENROUTER_API_KEY"]  # ustaw w env
 
 headers = {
     "Authorization": f"Bearer {API_KEY}",
@@ -11,11 +12,9 @@ headers = {
 }
 
 payload = {
-    "model": "gpt-5.4-mini",
-    "max_output_tokens": 256,
-    "instructions": "You must respond ONLY in English. Never use any other language, even if asked.",
-    "input": [
-        #{"role": "system", "content": "Respond only in English."},
+    "model": MODEL,
+    "max_tokens": 256,
+    "messages": [
         {"role": "user", "content": "Powiedz 'działa' po polsku."}
     ],
 }
@@ -26,4 +25,4 @@ resp.raise_for_status()
 data = resp.json()
 print(json.dumps(data, indent=2, ensure_ascii=False))
 print("\n--- odpowiedź ---")
-print(data["output"][0]["content"][0]["text"])
+print(data["choices"][0]["message"]["content"])

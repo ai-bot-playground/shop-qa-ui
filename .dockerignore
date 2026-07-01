@@ -12,11 +12,6 @@ test-endpoint/.venv
 **/venv
 .venv
 
-# legacy-satchmo: przyszły cel indeksowania (gdy dojdzie zapis wyników analizy).
-# Na razie nie trafia do obrazu — używamy sample/order_service.
-# Gdy będzie potrzebny: zmień na `legacy-satchmo/.git` (wpiecze kod bez nested .git).
-legacy-satchmo
-
 # Artefakty Pythona
 __pycache__
 **/__pycache__
@@ -39,6 +34,5 @@ __pycache__
 .DS_Store
 Thumbs.db
 
-# Dokumentacja archiwalna i PDF jury — niepotrzebne w runtime
+# Dokumentacja archiwalna — niepotrzebna w runtime
 docs/_archive
-example from jury/*.pdf

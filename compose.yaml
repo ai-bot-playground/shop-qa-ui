@@ -9,23 +9,21 @@
 #
 # Tryb dev bind-montuje całe repo (z .git), więc:
 #   - Streamlit przeładowuje się na żywo gdy instancje T1–T5 dopisują kod,
-#   - sandbox (apply_edit → pytest → git_commit) działa na realnym repo z historią git.
+#   - sandbox (worktree → PR) działa na realnym repo z historią git.
 
 services:
   app:
     build:
       context: .
       dockerfile: Containerfile
-    image: legacy-documenter:dev
-    container_name: legacy-documenter
+    image: shop-qa-ui:dev
+    container_name: shop-qa-ui
     ports:
       - "8501:8501"
     env_file:
       - .env.docker          # skopiuj z .env.docker.example i uzupełnij klucze Azure
     environment:
       # Wartości domyślne (env_file ma pierwszeństwo, jeśli ustawione).
-      LLM_PROVIDER: "azure"
-      REPO_PATH: "sample"
       STREAMLIT_PORT: "8501"
     volumes:
       # Dev: żywy kod + historia git (sandbox/commit). Do produkcji usuń ten mount

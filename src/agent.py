@@ -10,13 +10,7 @@ from .retriever import keyword_search
 
 load_dotenv()
 
-_ENDPOINT = os.environ.get(
-    "AZURE_ANTHROPIC_ENDPOINT",
-    "https://ai-remik.services.ai.azure.com/anthropic/v1/messages",
-)
-_MODEL = "claude-opus-4-8"
-
-# OpenRouter (OpenAI-compatible) — używany preferencyjnie, gdy ustawiony klucz.
+# OpenRouter (OpenAI-compatible) — jedyna aktywna ścieżka LLM.
 _OPENROUTER_ENDPOINT = os.environ.get(
     "OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1/chat/completions"
 )
@@ -59,32 +53,8 @@ def _openrouter_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY", "")
 
 
-def _api_key() -> str:
-    return (
-        os.environ.get("AZURE_ANTHROPIC_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
-        or ""
-    )
-
-
-def llm_available() -> bool:
-    """True gdy skonfigurowano jakikolwiek klucz API (realne wywołania LLM)."""
-    return bool(_openrouter_key() or _api_key())
-
-
-def is_demo_mode() -> bool:
-    """True gdy brak klucza API — aplikacja zwraca mockowane odpowiedzi,
-    aby można było przeklikać cały workflow bez podłączonego modelu."""
-    return not llm_available()
-
-
 def _call(system: str, user_content: str, max_tokens: int = 1024) -> str:
-    # Dyspozytor providera: OpenRouter (OpenAI-compatible) -> Azure Anthropic -> mock.
-    if _openrouter_key():
-        return _call_openrouter(system, user_content, max_tokens)
-    if _api_key():
-        return _call_anthropic(system, user_content, max_tokens)
-    return _mock_call(system, user_content, max_tokens)
+    return _call_openrouter(system, user_content, max_tokens)
 
 
 def _reasoning_param() -> dict:
@@ -158,23 +128,6 @@ def _call_openrouter(system: str, user_content: str, max_tokens: int) -> str:
     return _strip_think(content)
 
 
-def _call_anthropic(system: str, user_content: str, max_tokens: int) -> str:
-    headers = {
-        "x-api-key": _api_key(),
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": _MODEL,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": [{"role": "user", "content": user_content}],
-    }
-    resp = requests.post(_ENDPOINT, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    return resp.json()["content"][0]["text"]
-
-
 def _extract_json(text: str) -> dict:
     """Extract the first JSON object from text (handles markdown code fences)."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -191,7 +144,7 @@ def _build_context(chunks: list[CodeChunk]) -> str:
 
 
 _TECH_SYSTEM = """\
-Jesteś ekspertem od legacy code. Odpowiadasz NA PODSTAWIE KODU który dostałeś — nic więcej.
+Jesteś ekspertem od kodu tego systemu. Odpowiadasz NA PODSTAWIE KODU który dostałeś — nic więcej.
 
 Zasady:
 1. Każde stwierdzenie musi zawierać cytowanie w formacie [source: plik:linia].
@@ -468,9 +421,7 @@ def generate_file_change(question: str, proposals: list[dict],
         f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
         f"Zwróć pełną zaktualizowaną treść pliku:"
     )
-    # W trybie demo (brak klucza) _mock_call zwraca "" bez wyjątku. Realne błędy
-    # (np. TLS/serwer) NIE są maskowane jako pustka — propagujemy je, by UI mógł
-    # pokazać prawdziwą przyczynę zamiast mylącego "brak klucza API".
+    # Realne błędy (np. TLS/serwer) NIE są maskowane — propagujemy je do UI.
     result = _strip_fences(_call(_FILECHANGE_SYSTEM, user_msg, max_tokens=4096))
     # Sentinel/echo „BRAK_ZMIAN" → traktuj jako brak zmiany (nie wstawiaj tego
     # zdania jako treści pliku, co dawało diff kasujący cały plik).
@@ -601,7 +552,7 @@ def run_qa(question: str, repo_path: str = "", chunks: list[CodeChunk] | None = 
 
     Gdy `chunks` jest podany (pre-indexed, np. z ingest_app dla wielu repo),
     używa go bezpośrednio. W przeciwnym razie indeksuje `repo_path` (compat
-    z run_qa_eval w sandbox.py i starym flow).
+    Gdy `chunks` podany używa go bezpośrednio, inaczej indeksuje `repo_path`.
     """
     all_chunks = chunks if chunks is not None else ingest_repo(repo_path)
     relevant_chunks = keyword_search(all_chunks, question, top_k=5)
@@ -656,137 +607,3 @@ def run_qa(question: str, repo_path: str = "", chunks: list[CodeChunk] | None = 
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TRYB DEMONSTRACYJNY (mock) — używany automatycznie, gdy brak klucza API.
-# Cel: pełny workflow GUI (Analyze → Piaskownica → PR) działa bez podłączonego
-# modelu. Każda odpowiedź jest oznaczona jako przykładowa. Po ustawieniu
-# AZURE_ANTHROPIC_API_KEY (lub ANTHROPIC_API_KEY) kod automatycznie wraca do
-# realnych wywołań — nie trzeba nic przełączać.
-# ══════════════════════════════════════════════════════════════════════════════
-_DEMO_NOTE = (
-    "> ℹ️ *Tryb demonstracyjny (brak klucza API). To przykładowa odpowiedź "
-    "pokazująca format — uzupełnij `AZURE_ANTHROPIC_API_KEY`, aby uzyskać realną "
-    "analizę.*"
-)
-
-
-def _parse_first_chunk(user_content: str) -> tuple[str, str, str]:
-    """Wyłuskaj plik / symbol / pierwszą linię z kontekstu kodu (jeśli jest)."""
-    m = re.search(
-        r"# PLIK:\s*(.+?)\s*\|\s*FUNKCJA:\s*(.+?)\s*\|\s*LINIE:\s*(\d+)", user_content
-    )
-    if m:
-        return m.group(1), m.group(2), m.group(3)
-    return ("sample/module.py", "funkcja", "1")
-
-
-def _mock_tech_answer(user_content: str) -> str:
-    file, symbol, line = _parse_first_chunk(user_content)
-    return (
-        f"{_DEMO_NOTE}\n\n"
-        f"Na podstawie kodu logika powiązana z pytaniem znajduje się w funkcji "
-        f"`{symbol}`. Funkcja przyjmuje parametry wejściowe i zwraca wynik na "
-        f"podstawie wartości zaszytych bezpośrednio w jej ciele. "
-        f"[source: {file}:{line}]\n\n"
-        f"Najważniejsze obserwacje:\n"
-        f"- Wartości progowe / kody są zdefiniowane lokalnie w `{symbol}`, więc ich "
-        f"zmiana wymaga edycji kodu. [source: {file}:{line}]\n"
-        f"- Nieobsłużone przypadki zwracają wartość domyślną, co może maskować błędne "
-        f"dane wejściowe. [source: {file}:{line}]"
-    )
-
-
-def _mock_biz_json(user_content: str) -> str:
-    file, symbol, _line = _parse_first_chunk(user_content)
-    data = {
-        "business_context": {
-            "impact": "Średni",
-            "area": "Logika domenowa (przykład demo)",
-            "time_dev": "1–2 dni",
-            "time_test": "0,5 dnia",
-            "time_total": "2–3 dni",
-            "dependencies": [file, "Testy regresyjne modułu"],
-            "risk": "Średni — zmiana dotyka logiki obliczeniowej; wymaga regresji.",
-            "summary": (
-                f"[DEMO] Funkcja {symbol} zawiera logikę powiązaną z pytaniem. "
-                f"Poniższe propozycje są przykładowe — podłącz klucz API, aby "
-                f"otrzymać realną analizę biznesową."
-            ),
-        },
-        "feasibility": {
-            "verdict": "Z zastrzeżeniami",
-            "reason": (
-                f"[DEMO] Zmiana w {symbol} jest realna w naszym systemie, ale wymaga "
-                f"przejścia przez bramkę preprod (component -> build -> deploy -> acceptance). "
-                f"Podłącz klucz API, aby uzyskać realną ocenę wykonalności."
-            ),
-            "impacted_services": [file.split("/")[0] if "/" in file else file],
-            "impacted_files": [f"{file}:{_line}"],
-        },
-        "test_plan": {
-            "existing": ["[DEMO] Component Cucumber danego serwisu", "[DEMO] shop-acceptance-tests (cross-service)"],
-            "new": [f"[DEMO] Nowy scenariusz pokrywający zmianę w {symbol}"],
-        },
-        "proposals": [
-            {
-                "title": f"Wydziel parametry z {symbol} do konfiguracji",
-                "description": (
-                    "Przenieś zaszyte wartości/kody do stałej lub configu, aby zmiana "
-                    "nie wymagała edycji logiki funkcji."
-                ),
-                "effort": "Niski",
-                "risk": "Niski",
-                "commit_hint": f"refactor: wydziel parametry z {symbol} do konfiguracji",
-            },
-            {
-                "title": "Dodaj jawną obsługę nieznanych przypadków",
-                "description": (
-                    "Zwracaj czytelny błąd lub log zamiast cichej wartości domyślnej."
-                ),
-                "effort": "Średni",
-                "risk": "Średni",
-                "commit_hint": f"fix: jawna obsługa nieznanych wejść w {symbol}",
-            },
-            {
-                "title": "Uzupełnij testy jednostkowe",
-                "description": "Dodaj testy brzegowe pokrywające warianty wejścia.",
-                "effort": "Bardzo niski",
-                "risk": "Niski",
-                "commit_hint": f"test: dodaj testy brzegowe dla {symbol}",
-            },
-        ],
-        "recommended_index": 0,
-        "recommended_reason": (
-            "[DEMO] Wydzielenie parametrów daje najlepszy stosunek wartości do "
-            "nakładu i ryzyka — usuwa zaszyte wartości bez zmiany logiki."
-        ),
-    }
-    return json.dumps(data, ensure_ascii=False)
-
-
-def _mock_fix_code(user_content: str) -> str:
-    """Zwróć oryginalną funkcję (z adnotacją demo), aby piaskownica pozostała
-    uruchamialna — realny fix wymaga podłączonego modelu."""
-    m = re.search(
-        r"(?:Oryginalna funkcja|Funkcja):\n(.*?)\n\n"
-        r"(?:Pytanie użytkownika|Nieprzechodzące testy):",
-        user_content,
-        re.DOTALL,
-    )
-    source = (m.group(1) if m else user_content).strip()
-    return f"# [demo] Podłącz klucz API, aby wygenerować realną poprawkę.\n{source}"
-
-
-def _mock_call(system: str, user_content: str, max_tokens: int = 1024) -> str:
-    """Dyspozytor mocków — wybiera kształt odpowiedzi po systemowym promptcie."""
-    if system is _BIZ_SYSTEM:
-        return _mock_biz_json(user_content)
-    if system in (_FIX_SYSTEM, _FIX_TESTS_SYSTEM):
-        return _mock_fix_code(user_content)
-    if system in (_DIFF_SYSTEM, _FILECHANGE_SYSTEM, _NEWFILE_SYSTEM):
-        return ""  # tryb demo: realna zmiana wymaga podłączonego modelu
-    if system is _PLAN_SYSTEM:
-        return "{}"  # tryb demo: brak planu
-    if system is _VERIFY_SYSTEM:
-        return '{"complete": true, "notes": "[demo]", "missing": []}'
-    return _mock_tech_answer(user_content)

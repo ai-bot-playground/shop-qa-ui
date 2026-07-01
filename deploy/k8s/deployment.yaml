@@ -1,34 +1,34 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: legacy-documenter
-  namespace: legacy-documenter
+  name: shop-qa-ui
+  namespace: shop-qa-ui
   labels:
-    app.kubernetes.io/name: legacy-documenter
+    app.kubernetes.io/name: shop-qa-ui
 spec:
   replicas: 1                     # Streamlit trzyma stan sesji w pamięci — skalowanie
                                   # poziome wymaga sticky sessions / zewnętrznego store.
   selector:
     matchLabels:
-      app.kubernetes.io/name: legacy-documenter
+      app.kubernetes.io/name: shop-qa-ui
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: legacy-documenter
+        app.kubernetes.io/name: shop-qa-ui
     spec:
       containers:
         - name: app
-          # Podmień na swój rejestr (np. ACR: myregistry.azurecr.io/legacy-documenter:TAG)
-          image: legacy-documenter:dev
+          # Podmień na swój rejestr (np. ACR: myregistry.azurecr.io/shop-qa-ui:TAG)
+          image: shop-qa-ui:dev
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8501
           envFrom:
             - configMapRef:
-                name: legacy-documenter-config
+                name: shop-qa-ui-config
             - secretRef:
-                name: legacy-documenter-secrets
+                name: shop-qa-ui-secrets
           readinessProbe:
             httpGet:
               path: /_stcore/health

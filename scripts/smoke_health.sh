@@ -8,7 +8,7 @@
 set -u
 
 CLI="${CONTAINER_CLI:-podman}"
-IMAGE="${1:-localhost/legacy-documenter:ci}"
+IMAGE="${1:-localhost/shop-qa-ui:ci}"
 PORT="${STREAMLIT_PORT:-8501}"
 NAME="lcd-smoke-$$"
 

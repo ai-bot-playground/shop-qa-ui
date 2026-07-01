@@ -1,10 +1,9 @@
-# Containerfile — Legacy Code Documenter & Tribal-Knowledge Q&A (T09)
-# Build: podman build -t legacy-documenter:dev -f Containerfile .
+# Containerfile — shop-qa-ui (część ai-bot-playground)
+# Build: podman build -t shop-qa-ui:dev -f Containerfile .
 #   (działa też z `docker build`; plik jest zgodny z OCI/Dockerfile)
 #
-# Obraz pakuje monolit Streamlit. Kod aplikacji (app.py + src/*) wpinają
-# instancje T1–T5 wg docs/SPEC.md. Dopóki app.py nie istnieje, entrypoint
-# uruchamia placeholder — patrz docker/entrypoint.sh.
+# Obraz pakuje monolit Streamlit (app.py + src/*). Dopóki app.py nie istnieje,
+# entrypoint uruchamia placeholder — patrz docker/entrypoint.sh.
 
 FROM python:3.12-slim
 
@@ -25,14 +24,14 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-# Kod (uszanuj .dockerignore — bez .git, legacy-satchmo, .venv itd.)
+# Kod (uszanuj .dockerignore — bez .git, .venv itd.)
 COPY . .
 
 RUN chmod +x docker/entrypoint.sh
 
 # Tożsamość git dla commitów wykonywanych przez sandbox wewnątrz kontenera.
-RUN git config --system user.email "tool@legacy-documenter.local" \
-    && git config --system user.name "Legacy Documenter Bot" \
+RUN git config --system user.email "tool@shop-qa-ui.local" \
+    && git config --system user.name "shop-qa-ui bot" \
     && git config --system --add safe.directory '*'
 
 EXPOSE 8501

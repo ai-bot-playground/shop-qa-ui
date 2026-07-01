@@ -11,13 +11,11 @@ import pandas as pd
 from src.ingest import ingest_repo, ingest_app
 from src.agent import (
     run_qa, generate_code_fix, fix_code_with_tests, generate_change_diff,
-    generate_file_change, is_demo_mode, plan_change, build_repo_map, generate_new_file,
+    generate_file_change, plan_change, build_repo_map, generate_new_file,
     verify_completeness,
 )
 from src.sandbox import (
-    run_static_tests, replace_function_in_file, git_commit_file, commit_and_push_change,
-    run_qa_eval, check_diff_applies, open_pr_for_change, compute_diff,
-    open_pr_for_file_change, pr_checks, merge_pr, run_service_tests, open_pr_for_files,
+    compute_diff, open_pr_for_files, pr_checks, merge_pr, run_service_tests,
     pr_failure_summary,
 )
 from src.answer_types import ANSWER_TYPES, get_default_templates
@@ -57,7 +55,7 @@ def _pr_build_state(data: dict | None) -> str:
 
 
 st.set_page_config(
-    page_title="Analizator Kodu",
+    page_title="shop-qa-ui",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -124,7 +122,6 @@ def _log_question(question: str, result: dict, app_id: str | None) -> None:
             "session_id": st.session_state.active_session_id,
             "app": app_id,
             "question": question,
-            "demo_mode": is_demo_mode(),
             "repos_hit": sorted({c.repo for c in chunks if c.repo}),
             "citations": [f"{c.repo}/{c.file_path}:{c.start_line}" for c in chunks],
             "impacted_services": feas.get("impacted_services", []),
@@ -303,10 +300,8 @@ with st.sidebar:
                 for m in sess["messages"][-3:]:
                     st.caption(f"↳ {m['question'][:50]}…")
 
-    if is_demo_mode():
-        st.caption("🟡 Tryb demo — brak klucza API")
-    else:
-        st.caption("🟢 LLM Available (4.8 Opus)")
+    _active_model = os.environ.get("OPENROUTER_MODEL", "z-ai/glm-5.2")
+    st.caption(f"🟢 {_active_model}")
 
 # ── Sync query params → session state (stepper link navigation) ───────────────
 if "step" in st.query_params:
@@ -406,13 +401,6 @@ def _stepper_html(steps, active_tab, completed, active_idx):
 
 st.markdown(_stepper_html(STEPS, active_tab, completed, active_idx), unsafe_allow_html=True)
 st.markdown("---")
-
-if is_demo_mode():
-    st.info(
-        "🧪 **Tryb demonstracyjny** — nie wykryto klucza API, więc odpowiedzi LLM są "
-        "przykładowe (mock). Uzupełnij `AZURE_ANTHROPIC_API_KEY` w `.env` "
-        "(patrz `.env.example`), aby podłączyć model."
-    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # KROK 1 — System Ready
@@ -829,13 +817,10 @@ elif active_tab == "sandbox":
                             if mc.get("error"):
                                 st.error(f"Błąd LLM: {mc['error']}")
                             elif not (mc.get("new_content") or "").strip():
-                                if is_demo_mode():
-                                    st.info("Tryb demo — podłącz klucz API, aby wygenerować zmianę.")
-                                else:
-                                    st.warning(
-                                        f"Model zwrócił pustą treść dla `{mc['file_path']}` "
-                                        f"(serwis **{mc['repo']}**)."
-                                    )
+                                st.warning(
+                                    f"Model zwrócił pustą treść dla `{mc['file_path']}` "
+                                    f"(serwis **{mc['repo']}**)."
+                                )
                             elif not diff_str.strip():
                                 st.warning("Wygenerowana treść identyczna z oryginałem (brak zmian).")
                             else:
@@ -1052,162 +1037,6 @@ elif active_tab == "sandbox":
                             _advance()
                     st.stop()
 
-                # ── Ścieżka Python (sample/legacy) ────────────────────────────
-                # ── Pytanie użytkownika ───────────────────────────────────────
-                if question:
-                    st.markdown(
-                        f"<div style='background:#f0f4ff;border-left:4px solid #6366f1;"
-                        f"padding:10px 16px;border-radius:4px;margin-bottom:12px'>"
-                        f"<span style='font-size:12px;color:#6366f1;font-weight:600'>PYTANIE</span><br/>"
-                        f"{question}</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                # ── Zaakceptowana propozycja ──────────────────────────────────
-                if accepted_proposals:
-                    p = accepted_proposals[0]
-                    effort_icon = "🟢" if p["effort"] == "Bardzo niski" else ("🟡" if p["effort"] == "Niski" else "🔴")
-                    risk_icon = "🔴" if "Wysoki" in p["risk"] else ("🟢" if "Niski" in p["risk"] else "🟡")
-                    st.markdown(
-                        f"<div style='background:#f0fdf4;border-left:4px solid #22c55e;"
-                        f"padding:10px 16px;border-radius:4px;margin-bottom:16px'>"
-                        f"<span style='font-size:12px;color:#16a34a;font-weight:600'>PROPOZYCJA AGENTA</span><br/>"
-                        f"<b>{p['title']}</b><br/>"
-                        f"<span style='color:#555;font-size:13px'>{p['description']}</span><br/>"
-                        f"<span style='font-size:12px;color:#888'>Nakład: {effort_icon} {p['effort']} &nbsp;·&nbsp; "
-                        f"Ryzyko: {risk_icon} {p['risk']}</span></div>",
-                        unsafe_allow_html=True,
-                    )
-
-                # ── Generowanie kodu przez LLM (raz, cache w session_state) ──
-                if not st.session_state.get("sandbox_generated_code"):
-                    with st.spinner("Agent generuje propozycję kodu…"):
-                        proposal = accepted_proposals[0] if accepted_proposals else {}
-                        generated = generate_code_fix(chunk.source, proposal, question) if proposal else chunk.source
-                        st.session_state.sandbox_generated_code = generated
-                        st.session_state.sandbox_code_version = st.session_state.get("sandbox_code_version", 0) + 1
-                    st.rerun()
-
-                col_original, col_modified = st.columns([1, 1])
-                with col_original:
-                    st.markdown("**Plik oryginalny**")
-                    st.caption(f"`{chunk.file_path}:{chunk.start_line}–{chunk.end_line}`")
-                    st.code(chunk.source, language="python")
-                with col_modified:
-                    st.markdown("**Plik zmodyfikowany**")
-                    st.caption(f"`{chunk.file_path}`")
-                    edited_code = st.text_area(
-                        "Proponowany kod",
-                        value=st.session_state.sandbox_generated_code,
-                        height=300,
-                        label_visibility="collapsed",
-                        key=f"sandbox_code_{st.session_state.get('sandbox_code_version', 0)}",
-                    )
-                # When the last run had real failures, the button becomes a
-                # "fix & re-run" action; otherwise it just runs the tests.
-                prior_results = st.session_state.get("sandbox_results")
-                prior_real_failures = [
-                    r for r in (prior_results or [])
-                    if not r["passed"] and not r["name"].startswith("⚠️")
-                ]
-                in_fix_mode = bool(prior_real_failures)
-
-                run_clicked = st.button(
-                    "🔧 Napraw kod i uruchom ponownie testy" if in_fix_mode else "▶ Uruchom testy",
-                    type="primary", use_container_width=True,
-                )
-
-                if run_clicked:
-                    if in_fix_mode:
-                        with st.spinner("Agent naprawia kod i uruchamia testy ponownie…"):
-                            fixed_code = fix_code_with_tests(edited_code, prior_real_failures)
-                            results = run_static_tests(fixed_code)
-                        st.session_state.sandbox_generated_code = fixed_code
-                        st.session_state.sandbox_code_version = st.session_state.get("sandbox_code_version", 0) + 1
-                        st.session_state.sandbox_edited_code = fixed_code
-                    else:
-                        with st.spinner("Uruchamiam testy…"):
-                            results = run_static_tests(edited_code)
-                        st.session_state.sandbox_edited_code = edited_code
-
-                    st.session_state.sandbox_results = results
-                    st.session_state.sandbox_approved = set()
-                    st.session_state.sandbox_commit_done = None
-                    st.rerun()
-
-                st.markdown("---")
-                st.markdown("**Wyniki testów**")
-                results = st.session_state.get("sandbox_results")
-                if not results:
-                    st.caption("Kliknij '▶ Uruchom testy' aby zobaczyć wyniki.")
-                else:
-                    if "sandbox_approved" not in st.session_state:
-                        st.session_state.sandbox_approved = set()
-                    for r in results:
-                        if r["name"].startswith("⚠️"):
-                            st.session_state.sandbox_approved.add(r["name"])
-                    passed_count = sum(
-                        1 for r in results
-                        if r["passed"] or r["name"].startswith("⚠️")
-                    )
-                    st.metric("Testy", f"{passed_count} / {len(results)}")
-                    for r in results:
-                        if r["passed"]:
-                            st.success(f"✅ {r['name']}")
-                        elif r["name"].startswith("⚠️"):
-                            st.success(f"✅ {r['name']} — znany false positive, tak miało być")
-                        else:
-                            detail = f"błąd: {r['error']}" if r["error"] else f"oczekiwano: `{r['expected']}`, otrzymano: `{r['got']}`"
-                            st.error(f"❌ {r['name']}\n\n{detail}")
-
-                results = st.session_state.get("sandbox_results")
-                if results:
-                    approved = st.session_state.get("sandbox_approved", set())
-                    all_clear = all(r["passed"] or r["name"] in approved for r in results)
-
-                    if all_clear:
-                        st.divider()
-                        st.markdown("### Zatwierdź zmiany")
-                        accepted_proposals = st.session_state.get("sandbox_accepted_proposals", [])
-                        if accepted_proposals:
-                            st.markdown("**Które propozycje obejmuje ten commit?**")
-                            commit_checked = []
-                            for j, p in enumerate(accepted_proposals):
-                                if st.checkbox(p["title"], value=True, key=f"commit_prop_{j}"):
-                                    commit_checked.append(p)
-                            hints = "; ".join(p["commit_hint"] for p in commit_checked)
-                        else:
-                            hints = ""
-                        commit_msg = st.text_input("Commit message", value=hints, placeholder="fix: opisz co zostało zmienione")
-                        commit_clicked = st.button(
-                            "✅ Zatwierdź i zacommituj", type="primary",
-                            disabled=not commit_msg.strip(), use_container_width=True,
-                        )
-                        if commit_clicked and commit_msg.strip():
-                            edited = st.session_state.get("sandbox_edited_code", chunk.source)
-                            repo_path = st.session_state.get("repo_paths", {}).get(
-                                chunk.repo, st.session_state.get("repo_path", "")
-                            )
-                            with st.spinner("Zapisuję zmianę, commituję i wypycham branch…"):
-                                abs_path = replace_function_in_file(chunk, edited, repo_path)
-                                res = commit_and_push_change(abs_path, commit_msg.strip(), repo_path)
-                            if not res.get("success"):
-                                st.error(f"Błąd commita: {res.get('output') or 'nieznany błąd'}")
-                            else:
-                                st.session_state.sandbox_commit_done = res["commit_hash"] or "committed"
-                                st.session_state.sandbox_commit_msg = commit_msg.strip()
-                                st.session_state.sandbox_branch = res.get("branch", "")
-                                st.session_state.sandbox_pushed = res.get("pushed", False)
-                                st.session_state.sandbox_push_output = res.get("output", "")
-                                st.session_state.sandbox_manual_push = res.get("manual_push_cmd", "")
-                                st.session_state.sandbox_results = None
-                                st.rerun()
-
-                if st.session_state.get("sandbox_commit_done"):
-                    st.success(f"✅ Zacommitowano: `{st.session_state.sandbox_commit_done}`")
-                    if st.button("Przejdź dalej → PR", type="primary"):
-                        _advance()
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # KROK 4 — PR
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1347,76 +1176,4 @@ elif active_tab == "pr":
                     else:
                         st.error(f"Merge nieudany: {mres.get('error')}")
         st.stop()
-
-    # ── Ścieżka Python (sample/legacy) ────────────────────────────────────────
-    commit_hash = st.session_state.get("sandbox_commit_done")
-    commit_msg = st.session_state.get("sandbox_commit_msg", "")
-    branch = st.session_state.get("sandbox_branch", "")
-    pushed = st.session_state.get("sandbox_pushed", False)
-    push_output = st.session_state.get("sandbox_push_output", "")
-    manual_push = st.session_state.get("sandbox_manual_push", "")
-    proposals = st.session_state.get("sandbox_accepted_proposals", [])
-
-    if not commit_hash:
-        st.info("Brak zatwierdzonego commita. Wróć do kroku Piaskownica i zatwierdź zmianę.")
-    else:
-        if pushed:
-            st.markdown(
-                f"""
-                <div style="background:#f0fdf4;border:1.5px solid #86efac;border-radius:12px;padding:16px 20px;margin-bottom:16px">
-                    <div style="font-size:18px;font-weight:700;color:#166534">🚀 Branch <code>{branch}</code> wypchnięty</div>
-                    <div style="color:#15803d;margin-top:4px;font-size:14px">
-                        Pipeline GitHub Actions waliduje zmianę w Dockerze i przygotowuje Pull Request do <code>develop</code> (link w podsumowaniu przebiegu Actions; PR powstaje automatycznie, gdy repo zezwala Actions na tworzenie PR).
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.link_button("▶ Otwórz przebieg pipeline (Actions)",
-                           "https://github.com/ai-bot-playground/shop-qa-ui/actions",
-                           use_container_width=True)
-            st.link_button("🔀 Pull Requesty",
-                           "https://github.com/ai-bot-playground/shop-qa-ui/pulls",
-                           use_container_width=True)
-        else:
-            st.warning(
-                "Zmiana zacommitowana lokalnie, ale **branch nie został wypchnięty** "
-                "(brak tokena GH_TOKEN lub błąd push). Wypchnij ręcznie, aby uruchomić pipeline:"
-            )
-            if manual_push:
-                st.code(manual_push, language="bash")
-            if push_output:
-                with st.expander("Szczegóły błędu push"):
-                    st.code(push_output, language=None)
-
-        st.markdown("---")
-        col1, col2, col3 = st.columns(3)
-        col1.markdown(f"**Branch źródłowy**  \n`{branch or '—'}`")
-        col2.markdown("**Branch docelowy**  \n`develop`")
-        col3.markdown(f"**Commit**  \n`{commit_hash}`")
-
-        st.markdown("### 📋 Opis zmian")
-        st.markdown(f"**{commit_msg}**")
-
-        if proposals:
-            st.markdown("**Zaakceptowane propozycje:**")
-            for p in proposals:
-                effort_icon = "🟢" if p["effort"] == "Bardzo niski" else ("🟡" if p["effort"] == "Niski" else "🔴")
-                risk_icon = "🔴" if "Wysoki" in p["risk"] else ("🟢" if "Niski" in p["risk"] else "🟡")
-                st.markdown(
-                    f"- **{p['title']}** — nakład: {effort_icon} {p['effort']} · ryzyko: {risk_icon} {p['risk']}"
-                )
-                st.caption(f"  {p['description']}")
-
-        st.markdown("---")
-        st.markdown("### ✅ Checklist")
-        st.markdown(f"""
-- ✅ Testy statyczne przeszły (lub zaakceptowane false positive)
-- ✅ Zmiany przejrzane przez agenta AI
-- ✅ Propozycje zaakceptowane przez dewelopera (human-in-the-loop)
-- {'✅' if pushed else '⏳'} Branch wypchnięty na GitHub → trigger pipeline
-- ⏳ CI/CD pipeline waliduje w Dockerze i tworzy PR do `develop`
-""")
-        if pushed:
-            st.balloons()
 

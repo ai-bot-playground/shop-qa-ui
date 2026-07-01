@@ -3,14 +3,12 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: legacy-documenter-config
-  namespace: legacy-documenter
+  name: shop-qa-ui-config
+  namespace: shop-qa-ui
 data:
   # OpenRouter (OpenAI-compatible) — aktywna ścieżka LLM. Klucz API → secret
   # (OPENROUTER_API_KEY). src/agent.py: dyspozytor OpenRouter → mock.
   OPENROUTER_MODEL: "z-ai/glm-5.2"
   OPENROUTER_REASONING_EFFORT: "high"
   OPENROUTER_MAX_TOKENS: "32000"
-  # Repo docelowe (docelowo legacy-satchmo, gdy będzie zapis wyników analizy)
-  REPO_PATH: "sample/order_service"
   STREAMLIT_PORT: "8501"

@@ -11,7 +11,7 @@ class CodeChunk:
     start_line: int
     end_line: int
     source: str
-    repo: str = ""   # nazwa repozytorium (puste dla sample/legacy)
+    repo: str = ""   # nazwa repozytorium (puste dla sample)
 
 
 # Directories never worth indexing (build output, VCS, deps).

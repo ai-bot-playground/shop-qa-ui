@@ -4,24 +4,24 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: legacy-documenter
-  namespace: legacy-documenter
+  name: shop-qa-ui
+  namespace: shop-qa-ui
   annotations:
     # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     {}
 spec:
   rules:
-    - host: legacy-documenter.example.com   # ← podmień
+    - host: shop-qa-ui.example.com   # ← podmień
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: legacy-documenter
+                name: shop-qa-ui
                 port:
                   number: 80
   # tls:
-  #   - hosts: [legacy-documenter.example.com]
-  #     secretName: legacy-documenter-tls
+  #   - hosts: [shop-qa-ui.example.com]
+  #     secretName: shop-qa-ui-tls
