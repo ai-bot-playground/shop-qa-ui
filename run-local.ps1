@@ -1,4 +1,4 @@
-# run-local.ps1 — uruchamia shop-qa-ui NATYWNIE na hoście (bez kontenera).
+﻿# run-local.ps1 — uruchamia shop-qa-ui NATYWNIE na hoście (bez kontenera).
 #
 # Dlaczego natywnie, a nie w kontenerze:
 #   Funkcja "Otwórz PR" (src/sandbox.py) operuje na LOKALNYCH klonach repo —
@@ -18,7 +18,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # Katalog tego skryptu = katalog shop-qa-ui.
-$here = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$here = $PSScriptRoot
 Set-Location $here
 
 # Root repozytoriów = katalog nadrzędny (ai-bot-playground z siostrzanymi shop-*).
