@@ -12,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # git    — wymagany przez sandbox (apply_edit → git_commit) oraz uruchamianie pytest
-# ca-certificates — TLS do Azure AI Foundry
+# ca-certificates — TLS do OpenRouter i GitHub
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*

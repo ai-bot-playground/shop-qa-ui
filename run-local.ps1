@@ -34,7 +34,7 @@ if (-not (Test-Path $venvPy)) {
   if ($LASTEXITCODE -ne 0) { throw "pip install nie powiódł się" }
 }
 
-# Klucze API (OPENROUTER_*, AZURE_*) czyta app przez python-dotenv z ./.env.
+# Klucze API (OPENROUTER_*) czyta app przez python-dotenv z ./.env.
 $env:SHOP_REPOS_DIR = $reposRoot
 # Telemetria tokenów: natywnie serwis jest pod localhost:8088 (port-forward-ui.ps1).
 if (-not $env:TOKEN_METRICS_URL) { $env:TOKEN_METRICS_URL = 'http://localhost:8088' }

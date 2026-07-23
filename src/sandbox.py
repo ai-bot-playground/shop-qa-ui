@@ -134,6 +134,231 @@ def compute_diff(old: str, new: str, rel_path: str) -> str:
     ))
 
 
+def _safe_relative_path(raw_path: str) -> str:
+    """Normalize a generated path and reject absolute/path-traversal targets."""
+    from pathlib import PurePosixPath
+
+    normalized = (raw_path or "").replace("\\", "/").strip()
+    path = PurePosixPath(normalized)
+    if (not normalized or path.is_absolute() or ".." in path.parts
+            or (path.parts and ":" in path.parts[0])):
+        raise ValueError(f"Niebezpieczna ścieżka pliku: {raw_path!r}")
+    return path.as_posix()
+
+
+def _content_syntax_error(rel_path: str, content: str) -> str:
+    """Return a cheap, deterministic syntax error for formats we can parse locally."""
+    import json
+
+    suffix = os.path.splitext(rel_path)[1].lower()
+    try:
+        if suffix == ".json":
+            json.loads(content)
+        elif suffix in (".yml", ".yaml") and "{{" not in content and "{%" not in content:
+            import yaml
+            yaml.safe_load(content)
+        elif suffix == ".py":
+            compile(content, rel_path, "exec")
+    except Exception as exc:
+        return f"{rel_path}: {exc}"
+    return ""
+
+
+def _project_validation_commands(worktree: str) -> list[list[str]]:
+    """Offline build commands for the repository type present in `worktree`."""
+    gradle = "gradlew.bat" if os.name == "nt" else "gradlew"
+    gradle_path = os.path.join(worktree, gradle)
+    if os.path.isfile(gradle_path):
+        return [[gradle_path, "--offline", "--no-daemon", "classes", "testClasses"]]
+
+    package_json = os.path.join(worktree, "package.json")
+    if os.path.isfile(package_json):
+        import json
+        try:
+            with open(package_json, encoding="utf-8") as fh:
+                scripts = (json.load(fh).get("scripts") or {})
+        except (OSError, ValueError):
+            scripts = {}
+        if "build" in scripts:
+            npm = "npm.cmd" if os.name == "nt" else "npm"
+            commands: list[list[str]] = []
+            if os.path.isfile(os.path.join(worktree, "package-lock.json")):
+                commands.append([
+                    npm, "ci", "--offline", "--ignore-scripts", "--no-audit", "--fund=false",
+                ])
+            commands.append([npm, "run", "build"])
+            return commands
+
+    if any(os.path.isfile(os.path.join(worktree, name)) for name in (
+        "pyproject.toml", "requirements.txt", "setup.py",
+    )):
+        import sys
+        return [[sys.executable, "-m", "compileall", "-q", "."]]
+    return []
+
+
+def _validation_failure_kind(command: list[str], output: str) -> str:
+    """Classify dependency/tooling failures so they are not sent to the code-repair LLM."""
+    text = (output or "").lower()
+    environment_markers = (
+        "enotcached",
+        "cache mode is 'only-if-cached'",
+        "no cached version",
+        "could not resolve all files",
+        "could not install gradle distribution",
+        "could not find a java installation",
+        "java_home",
+        "is not recognized as an internal or external command",
+        "command not found",
+        "cannot find module",
+        "toolchain download repositories have not been configured",
+    )
+    if any(marker in text for marker in environment_markers):
+        return "environment"
+    return "code"
+
+
+def validate_file_changes(file_changes: list[dict], local_repo: str,
+                          timeout: int = 600) -> dict:
+    """Validate generated files in a detached local worktree, without network or PRs.
+
+    `file_changes` accepts `{path|file_path, content|new_content}` dictionaries.
+    Gradle validation compiles main and test sources but does not execute component
+    tests, so it does not start Testcontainers or local services.
+    """
+    import shutil
+    import uuid
+
+    result = {
+        "success": False,
+        "commands": [],
+        "output": "",
+        "error": "",
+        "project_check": False,
+        "failure_kind": "",
+    }
+    if not os.path.isdir(os.path.join(local_repo or "", ".git")):
+        result["error"] = f"Nie znaleziono lokalnego repo: {local_repo}"
+        result["failure_kind"] = "environment"
+        return result
+
+    normalized: list[tuple[str, str]] = []
+    try:
+        for change in file_changes:
+            rel_path = _safe_relative_path(change.get("path") or change.get("file_path") or "")
+            content = change.get("content")
+            if content is None:
+                content = change.get("new_content")
+            if content is None:
+                continue
+            syntax_error = _content_syntax_error(rel_path, str(content))
+            if syntax_error:
+                result["error"] = f"Błąd składni: {syntax_error}"
+                result["failure_kind"] = "code"
+                return result
+            normalized.append((rel_path, str(content)))
+    except ValueError as exc:
+        result["error"] = str(exc)
+        result["failure_kind"] = "input"
+        return result
+
+    if not normalized:
+        result["error"] = "Brak wygenerowanych plików do walidacji."
+        result["failure_kind"] = "input"
+        return result
+
+    worktree = os.path.join(_clone_base(), f"validate-{uuid.uuid4().hex[:10]}")
+    added = False
+    outputs: list[str] = []
+    try:
+        add = subprocess.run(
+            ["git", "-C", local_repo, "worktree", "add", "--detach", worktree, "HEAD"],
+            capture_output=True, text=True,
+        )
+        if add.returncode != 0:
+            result["error"] = f"worktree add: {(add.stderr or add.stdout).strip()}"
+            result["failure_kind"] = "environment"
+            return result
+        added = True
+
+        worktree_root = os.path.abspath(worktree)
+        for rel_path, content in normalized:
+            target = os.path.abspath(os.path.join(worktree_root, *rel_path.split("/")))
+            if os.path.commonpath((worktree_root, target)) != worktree_root:
+                result["error"] = f"Ścieżka wychodzi poza worktree: {rel_path}"
+                result["failure_kind"] = "input"
+                return result
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(content if content.endswith("\n") else content + "\n")
+
+        intent = subprocess.run(
+            ["git", "-C", worktree, "add", "--intent-to-add", "--all"],
+            capture_output=True, text=True,
+        )
+        if intent.returncode != 0:
+            result["error"] = f"git add --intent-to-add: {(intent.stderr or intent.stdout).strip()}"
+            result["failure_kind"] = "environment"
+            return result
+
+        commands = [["git", "-C", worktree, "diff", "--check"]]
+        project_commands = _project_validation_commands(worktree)
+        commands.extend(project_commands)
+        result["project_check"] = bool(project_commands)
+
+        env = os.environ.copy()
+        env["CI"] = "true"
+        for command in commands:
+            display = subprocess.list2cmdline(command)
+            result["commands"].append(display)
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=worktree,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                partial = "\n".join(filter(None, [exc.stdout or "", exc.stderr or ""]))
+                result["output"] = "\n\n".join(outputs + [partial]).strip()
+                result["error"] = f"Przekroczono limit {timeout}s: {display}"
+                result["failure_kind"] = "environment"
+                return result
+            except OSError as exc:
+                result["output"] = "\n\n".join(outputs).strip()
+                result["error"] = f"Nie można uruchomić `{display}`: {exc}"
+                result["failure_kind"] = "environment"
+                return result
+            output = "\n".join(filter(None, [completed.stdout, completed.stderr])).strip()
+            outputs.append(f"> {display}\n{output}".rstrip())
+            if completed.returncode != 0:
+                result["output"] = "\n\n".join(outputs).strip()
+                result["error"] = f"Walidacja nie przeszła (exit {completed.returncode})."
+                result["failure_kind"] = _validation_failure_kind(command, output)
+                return result
+
+        result["success"] = True
+        result["output"] = "\n\n".join(outputs).strip()
+        return result
+    finally:
+        if added:
+            subprocess.run(
+                ["git", "-C", local_repo, "worktree", "remove", "--force", worktree],
+                capture_output=True, text=True,
+            )
+        shutil.rmtree(worktree, ignore_errors=True)
+
+
+def validation_passed_for_repos(results: dict, repos) -> bool:
+    """True only when every changed repository has a current green result."""
+    required = set(repos)
+    return bool(required) and all(
+        bool((results.get(repo) or {}).get("success")) for repo in required
+    )
+
+
 def _resolve_local_repo(local_repo: str | None, repo_slug: str) -> str | None:
     """Ścieżka do LOKALNEGO klonu serwisu. Najpierw jawnie podany `local_repo`,
     potem SHOP_REPOS_DIR/<nazwa-repo> (domyślnie ../ai-bot-playground)."""

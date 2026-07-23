@@ -12,11 +12,11 @@ from src.ingest import ingest_repo, ingest_app
 from src.agent import (
     run_qa, generate_code_fix, fix_code_with_tests, generate_change_diff,
     generate_file_change, plan_change, build_repo_map, generate_new_file,
-    verify_completeness,
+    verify_completeness, repair_file_change,
 )
 from src.sandbox import (
     compute_diff, open_pr_for_files, pr_checks, merge_pr,
-    pr_failure_summary,
+    pr_failure_summary, validate_file_changes, validation_passed_for_repos,
 )
 from src.answer_types import ANSWER_TYPES, get_default_templates
 
@@ -703,7 +703,8 @@ elif active_tab == "sandbox":
                         with st.spinner("Planuję zmianę w całej aplikacji (które pliki zmienić/utworzyć)…"):
                             repo_map = build_repo_map(st.session_state.get("chunks", []))
                             st.session_state.sandbox_plan = plan_change(
-                                question, repo_map, accepted_proposals
+                                question, repo_map, accepted_proposals,
+                                st.session_state.get("sandbox_preload_chunks") or [],
                             )
                         st.rerun()
 
@@ -772,12 +773,14 @@ elif active_tab == "sandbox":
                             for t in targets
                         ]
                         st.session_state.sandbox_test_results = {}  # nowe zmiany → testy nieaktualne
+                        st.session_state.sandbox_validation_results = {}
                         st.session_state.sandbox_verify = None       # i weryfikacja nieaktualna
                     multi = st.session_state.sandbox_multi_changes
 
                     # Generuj zmiany dla plików bez wygenerowanej treści.
                     to_gen = [mc for mc in multi if mc["new_content"] is None]
                     if to_gen:
+                        st.session_state.sandbox_validation_results = {}
                         with st.spinner(f"Generuję zmiany dla {len(to_gen)}/{len(multi)} pliku/plików…"):
                             for mc in to_gen:
                                 try:
@@ -846,6 +849,7 @@ elif active_tab == "sandbox":
                         if st.button("♻️ Ponów generowanie pustych", use_container_width=True):
                             for mc in empty:
                                 mc["new_content"] = None  # pętla generowania wygeneruje je ponownie
+                            st.session_state.sandbox_validation_results = {}
                             st.rerun()
 
                     with st.expander("🔍 Weryfikacja kompletności (agent-recenzent)",
@@ -912,9 +916,118 @@ elif active_tab == "sandbox":
                                         added += 1
                                     st.session_state.sandbox_verify = None
                                     st.session_state.sandbox_test_results = {}
+                                    st.session_state.sandbox_validation_results = {}
                                     if added:
                                         st.toast(f"Dodano {added} plik(ów) do planu — generuję…")
                                     st.rerun()
+
+                    # ── Lokalna bramka przed PR: worktree → build → log → naprawa → build ──
+                    changed_by_repo: dict[str, list[dict]] = {}
+                    for mc in multi:
+                        if (mc.get("diff") or "").strip() and (mc.get("new_content") or "").strip():
+                            changed_by_repo.setdefault(mc["repo"], []).append(mc)
+
+                    st.markdown("---")
+                    st.markdown("### Walidacja lokalna przed PR")
+                    st.caption(
+                        "Zmiany są nakładane w odłączonym worktree. Gradle kompiluje kod i testy "
+                        "w trybie offline; nie uruchamiamy Testcontainers, usług, PR-ów ani preprod."
+                    )
+                    if st.button(
+                        "▶ Uruchom walidację wszystkich zmienionych repo",
+                        use_container_width=True,
+                        disabled=not changed_by_repo,
+                    ):
+                        validation_results: dict = {}
+                        with st.spinner(f"Waliduję {len(changed_by_repo)} repozytorium/repozytoria…"):
+                            for repo, repo_changes in changed_by_repo.items():
+                                validation_results[repo] = validate_file_changes(
+                                    repo_changes,
+                                    repo_changes[0]["repo_path"],
+                                )
+                        st.session_state.sandbox_validation_results = validation_results
+                        st.rerun()
+
+                    validation_results = st.session_state.get("sandbox_validation_results") or {}
+                    failed_repos: list[str] = []
+                    repairable_repos: list[str] = []
+                    for repo, repo_changes in changed_by_repo.items():
+                        validation = validation_results.get(repo)
+                        if not validation:
+                            st.info(f"⏳ `{repo}` — oczekuje na walidację.")
+                            continue
+                        if validation.get("success"):
+                            check_kind = "build projektu" if validation.get("project_check") else "kontrola statyczna"
+                            st.success(f"✅ `{repo}` — {check_kind} zakończony pomyślnie.")
+                        else:
+                            failed_repos.append(repo)
+                            st.error(f"❌ `{repo}` — {validation.get('error', 'walidacja nieudana')}")
+                            if validation.get("failure_kind") == "environment":
+                                st.info(
+                                    "To problem środowiska lub brak zależności offline, nie błąd "
+                                    "wygenerowanego kodu. Uzupełnij lokalne zależności i ponów walidację."
+                                )
+                            else:
+                                repairable_repos.append(repo)
+                        with st.expander(f"Log walidacji: {repo}"):
+                            for command in validation.get("commands", []):
+                                st.code(command, language="powershell")
+                            if validation.get("output"):
+                                st.code(validation["output"], language=None)
+                            elif validation.get("error"):
+                                st.code(validation["error"], language=None)
+
+                    if repairable_repos and st.button(
+                        "🛠 Popraw pliki według logów i zweryfikuj ponownie",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        repaired_count = 0
+                        updated_results = dict(validation_results)
+                        with st.spinner("Naprawiam błędy wskazane przez lokalną walidację…"):
+                            for repo in repairable_repos:
+                                repo_changes = changed_by_repo[repo]
+                                failure = validation_results[repo]
+                                failure_context = "\n".join(filter(None, [
+                                    failure.get("error", ""), failure.get("output", ""),
+                                ]))
+                                for mc in repo_changes:
+                                    current = mc.get("new_content") or ""
+                                    try:
+                                        repaired = repair_file_change(
+                                            question,
+                                            accepted_proposals,
+                                            repo,
+                                            mc["file_path"],
+                                            current,
+                                            failure_context,
+                                            repo_changes,
+                                        )
+                                    except Exception as exc:
+                                        mc["error"] = str(exc)
+                                        continue
+                                    if repaired.strip() and repaired != current:
+                                        mc["new_content"] = repaired
+                                        mc["diff"] = compute_diff(
+                                            mc["original"], repaired, mc["file_path"]
+                                        )
+                                        mc["error"] = None
+                                        repaired_count += 1
+                                updated_results[repo] = validate_file_changes(
+                                    repo_changes,
+                                    repo_changes[0]["repo_path"],
+                                )
+                        st.session_state.sandbox_validation_results = updated_results
+                        if repaired_count:
+                            st.session_state.sandbox_verify = None
+                            st.toast(f"Poprawiono {repaired_count} plik(ów) i ponowiono walidację.")
+                        else:
+                            st.warning("Agent nie wskazał zmian w plikach na podstawie logu.")
+                        st.rerun()
+
+                    validation_ready = validation_passed_for_repos(
+                        validation_results, changed_by_repo
+                    )
 
                     # Status PR per-repo (już wystawionych).
                     done_prs = [mc for mc in multi if mc.get("pr_result") is not None]
@@ -943,11 +1056,19 @@ elif active_tab == "sandbox":
                             else f"change: {n_repos_p} serwisów"
                         )
                         pr_title = st.text_input("Tytuł PR / commit", value=default_title or "change")
-                        st.caption("Walidacja testowa wykona się w CI (`preprod-gate`) po utworzeniu PR.")
+                        if not validation_ready:
+                            st.warning(
+                                "PR jest zablokowany do czasu zielonej lokalnej walidacji "
+                                "każdego zmienionego repo."
+                            )
+                        st.caption(
+                            "Po lokalnej walidacji CI (`preprod-gate`) pozostaje drugą, pełną bramką."
+                        )
                         if st.button(
                             f"🚀 Wystaw {'PR' if n_repos_p == 1 else f'{n_repos_p} PRy/PRów'} "
                             f"({n_repos_p} {'repozytorium' if n_repos_p == 1 else 'repozytoria/repozytoriów'})",
                             type="primary", use_container_width=True,
+                            disabled=not validation_ready,
                         ):
                             with st.spinner(f"Wystawiam {n_repos_p} PR-ów (po jednym na repo)…"):
                                 for repo, mcs in pending_by_repo.items():

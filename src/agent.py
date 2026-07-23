@@ -48,13 +48,79 @@ System docelowy: sklep flash-sale na mikroserwisach (organizacja ai-bot-playgrou
 - Bramka jakosci: PR do main -> preprod-gate (component tests -> build obrazu -> deploy kind-preprod -> acceptance). Tylko zielona bramka pozwala na merge.
 """
 
+# Procedura, którą LLM ma wykonać, planując i generując zmianę obejmującą CAŁY system.
+# Wstrzykiwana do plannera i recenzenta kompletności, aby zmiana była KOMPLETNA
+# (wszystkie warstwy) i SPÓJNA (jedna pisownia pojęć) oraz zgodna z bramką preprod-gate.
+_CHANGE_PLAYBOOK = """\
+PROCEDURA WPROWADZANIA ZMIAN W CAŁYM SYSTEMIE (wykonaj krok po kroku):
+
+KROK 1 — ZASIĘG PRZEZ WARSTWY. Ustal, których warstw dotyka zmiana, i uwzględnij KAŻDĄ
+potrzebną (myśl w tej kolejności: dane → logika → zdarzenia → API → frontend → konfiguracja → testy):
+  1. DANE: nowa/zmieniona kolumna → NOWA migracja Flyway `V{N+1}__opis.sql` (NIGDY nie edytuj
+     już zastosowanej migracji) + encja JPA + repozytorium. `ddl-auto=none`, więc schemat
+     musi wynikać z migracji, nie z encji.
+  2. LOGIKA: klasa @Service z regułą biznesową; zachowaj niezmienniki sagi, idempotencję
+     i outbox (patrz KROK 3).
+  3. ZDARZENIA (Kafka): jeśli zmienia się kształt zdarzenia — zmień PRODUCENTA (budowa payloadu
+     w service/outbox) ORAZ WSZYSTKICH KONSUMENTÓW tego tematu we WSZYSTKICH serwisach.
+     Kontrakty zdarzeń to ręcznie składany JSON (brak wspólnej biblioteki): nowe pole trzeba
+     WYPISAĆ u producenta i ODCZYTAĆ tam, gdzie potrzebne; brak pola konsument musi tolerować.
+     Zachowaj klucz partycji (order-events/payment-events: orderId; inventory-events: productId).
+  4. API: kontroler REST + DTO/response. Nowa publiczna ścieżka → dodaj też trasę w
+     shop-gateway `application.yml` (`/api/...` -> serwis, `StripPrefix=1`).
+  5. FRONTEND: shop-ui (React/JSX), jeśli zmiana jest widoczna dla użytkownika; wołaj przez
+     `/api/*` (gateway); przy zapisie zachowaj nagłówek `Idempotency-Key`.
+  6. KONFIGURACJA: `application.yml` (properties, flagi np. `shop.test-support.enabled`),
+     `build.gradle` (nowe zależności). Env w helm/compose tylko jeśli konieczne.
+  7. TESTY: zaktualizuj/dodaj scenariusze — per-serwis Cucumber (`.feature` + kroki),
+     a dla zmian obserwowalnych cross-service scenariusz w shop-acceptance-tests. Testy są
+     CZĘŚCIĄ zmiany (bramka je uruchamia), nie opcją.
+
+KROK 2 — JEDEN SŁOWNIK (spójność między plikami). Zanim wygenerujesz pliki, ustal RAZ i używaj
+DOKŁADNIE tych samych nazw we wszystkich plikach: pola/kolumny, wartości `type` zdarzeń, nazwy
+tematów, ścieżki endpointów, pola DTO, wartości enum statusów. Nigdy nie twórz drugiej pisowni
+tego samego pojęcia w innym pliku.
+
+KROK 3 — NIEZMIENNIKI (nie łam ich):
+  - baza-na-serwis: nie odpytuj cudzej bazy; dane między serwisami płyną REST-em (sync, np.
+    order→catalog po cenę) albo zdarzeniami Kafka (async).
+  - idempotencja: konsumenci deduplikują po kluczu (`processed_events`); produkcja przez outbox;
+    nie wprowadzaj podwójnego przetwarzania.
+  - saga zamówienia: PENDING→RESERVED→CONFIRMED lub kompensacja (CANCELLED/REJECTED),
+    `payment_deadline` + skaner timeoutów; zachowaj ścieżki kompensacji.
+  - Flyway addytywnie; kod kompilowalny i zgodny ze stylem (Java/Spring: pakiet
+    `com.shop.<serwis>...`; React/Vite dla shop-ui).
+
+KROK 4 — MINIMALNIE, ALE KOMPLETNIE. Ruszaj tylko to, co konieczne, ale dołącz KAŻDY plik
+potrzebny, by zmiana działała end-to-end (żadnych wiszących odwołań: dodajesz pole DTO →
+zaktualizuj mapowanie/użycie; importujesz nową klasę → utwórz ją).
+
+KROK 5 — DEFINICJA UKOŃCZENIA (= bramka preprod-gate). Zestaw plików musi: (a) się kompilować,
+(b) utrzymać zielone testy komponentowe każdego dotkniętego serwisu (zaktualizuj je, jeśli
+zmieniłeś zachowanie), (c) utrzymać/rozszerzyć zielony pakiet akceptacyjny cross-service.
+Zmieniasz zachowanie widoczne z zewnątrz → test to potwierdzający MUSI być w planie.\
+"""
+
+# Skrócone zasady spójności — wstrzykiwane przy generowaniu POJEDYNCZEGO pliku
+# (tańsze niż pełna procedura, a pilnują najważniejszego: jednej pisowni i kompilowalności).
+_CONSISTENCY_RULES = """\
+ZASADY SPÓJNOŚCI (dla generowanego pliku, ma pasować do reszty zestawu zmiany):
+- Używaj DOKŁADNIE tych samych nazw (pól/kolumn/`type` zdarzeń/tematów/endpointów/DTO/statusów)
+  co w pozostałych plikach zmiany — jedna pisownia pojęcia w całym systemie.
+- Kod kompilowalny i zgodny ze stylem warstwy (Java/Spring; React/JSX dla shop-ui).
+- Zdarzenia Kafka: producent WYPISUJE nowe pole, konsument potrafi je ODCZYTAĆ/zignorować;
+  nie zmieniaj klucza partycji.
+- Migracje Flyway tylko addytywnie (nowy plik `V{N+1}`), nigdy edycja zastosowanej migracji.
+- Nie odwołuj się do klas/plików, których ta zmiana nie tworzy; nie łam idempotencji ani sagi.\
+"""
+
 
 def _openrouter_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY", "")
 
 
-def _call(system: str, user_content: str, max_tokens: int = 1024) -> str:
-    return _call_openrouter(system, user_content, max_tokens)
+def _call(system: str, user_content: str, max_tokens: int = 1024, light: bool = False) -> str:
+    return _call_openrouter(system, user_content, max_tokens, light=light)
 
 
 def _reasoning_param() -> dict:
@@ -100,20 +166,31 @@ def _emit_token_metrics(model: str, usage: dict) -> None:
         pass  # metryki są pomocnicze — cisza przy awarii
 
 
-def _call_openrouter(system: str, user_content: str, max_tokens: int) -> str:
+def _call_openrouter(system: str, user_content: str, max_tokens: int,
+                     light: bool = False) -> str:
     headers = {
         "Authorization": f"Bearer {_openrouter_key()}",
         "Content-Type": "application/json",
     }
+    # light=True — tanie zadania pomocnicze (np. ekspansja zapytania): bez
+    # rozumowania i bez podłogi 32k na wyjście, żeby nie płacić pełnego thinkingu
+    # za drobny krok. Główne wywołania (odpowiedź, analiza, plan, weryfikacja)
+    # zostają na pełnym thinkingu z dużym budżetem wyjścia.
+    if light:
+        out_cap = max_tokens
+        reasoning: dict = {"enabled": False}
+    else:
+        # Duży budżet wyjścia, by rozumowanie nie ucięło odpowiedzi.
+        out_cap = max(max_tokens, _OPENROUTER_MAX_TOKENS)
+        reasoning = _reasoning_param()
     payload = {
         "model": _OPENROUTER_MODEL,
-        # Duży budżet wyjścia, by rozumowanie nie ucięło odpowiedzi.
-        "max_tokens": max(max_tokens, _OPENROUTER_MAX_TOKENS),
+        "max_tokens": out_cap,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user_content},
         ],
-        "reasoning": _reasoning_param(),
+        "reasoning": reasoning,
         # Poproś o pełne `usage` (w tym koszt) w odpowiedzi — do telemetrii tokenów.
         "usage": {"include": True},
     }
@@ -269,9 +346,11 @@ _PLAN_SYSTEM = """\
 Jesteś architektem systemu opisanego w KONTEKST SYSTEMU. Dostajesz MAPĘ REPOZYTORIÓW
 (istniejące pliki i symbole każdego serwisu) oraz żądaną zmianę biznesową.
 
-Twoje zadanie: zaplanuj KTÓRE pliki trzeba zmienić i JAKIE nowe utworzyć, aby zrealizować
-zmianę w całym systemie (frontend + gateway + serwisy). Myśl warstwami: UI, propagacja przez
-gateway, logika w serwisie, kontrakt/dane.
+Twoje zadanie: zaplanuj KTÓRE pliki zmienić i JAKIE nowe utworzyć, aby zrealizować zmianę
+end-to-end w całym systemie. Przejdź PROCEDURĘ WPROWADZANIA ZMIAN krok po kroku i po kolei
+przez warstwy: dane (Flyway/encje) → logika (@Service, saga) → zdarzenia (Kafka: producent
++ WSZYSCY konsumenci) → API (kontroler/DTO + trasa w gateway) → frontend (shop-ui) →
+konfiguracja (application.yml/build.gradle) → testy (Cucumber per-serwis + acceptance).
 
 Odpowiedz WYŁĄCZNIE prawidłowym JSON (bez markdown, bez wyjaśnień):
 {
@@ -287,11 +366,13 @@ Odpowiedz WYŁĄCZNIE prawidłowym JSON (bez markdown, bez wyjaśnień):
 
 Zasady:
 - Używaj WYŁĄCZNIE repozytoriów występujących w MAPIE REPOZYTORIÓW.
-- "modify" dla istniejących plików (muszą być w MAPIE), "create" dla nowych (ścieżka zgodna z
-  konwencją pakietu/katalogu danego serwisu).
-- Uwzględnij WSZYSTKIE warstwy potrzebne do działania zmienia (np. komponent UI + filtr w
-  gateway + logika w serwisie). Nie pomijaj frontendu, jeśli zmiana go dotyczy.
-- Plan minimalny ale KOMPLETNY. Nie dodawaj plików nieistotnych dla zmiany.
+- "modify" dla istniejących plików (muszą być w MAPIE), "create" dla nowych (ścieżka zgodna
+  z konwencją pakietu/katalogu serwisu).
+- Uwzględnij KAŻDĄ warstwę, której zmiana dotyka — nie pomijaj migracji Flyway, konsumentów
+  zdarzeń, trasy w gateway, frontendu ani TESTÓW (bramka je uruchamia).
+- Zmieniasz kształt zdarzenia Kafka → zaplanuj producenta ORAZ wszystkich konsumentów danego
+  tematu we wszystkich serwisach.
+- Plan minimalny, ale KOMPLETNY (bez wiszących odwołań). Nie dodawaj plików nieistotnych.
 - Odpowiadaj po polsku w polu reason.\
 """
 
@@ -305,7 +386,11 @@ Oceń, czy zestaw plików jest KOMPLETNY i spójny, by zmiana RZECZYWIŚCIE dzia
   nieutworzony; DTO/encja/endpoint/konfiguracja; rejestracja beana; routing; nagłówek po stronie
   klienta i jego odbiór po stronie serwera),
 - czy pliki ze statusem "empty" trzeba jednak wygenerować, bo są potrzebne,
-- czy warstwy się spinają (UI → gateway → serwis → dane).
+- czy warstwy się spinają (dane → logika → zdarzenia → API/gateway → UI),
+- czy przy zmianie schematu jest migracja Flyway (`V{N+1}`) spójna z encją,
+- czy przy zmianie zdarzenia Kafka zmieniono producenta ORAZ wszystkich konsumentów tematu,
+- czy nowej publicznej ścieżce API towarzyszy trasa w shop-gateway,
+- czy zmiana zachowania ma pokrycie w testach (Cucumber per-serwis / acceptance) — bramka je uruchomi.
 
 Odpowiedz WYŁĄCZNIE prawidłowym JSON (bez markdown):
 {
@@ -333,6 +418,18 @@ Zasady:
 3. Plik ma realizować swoją część żądanej zmiany (zgodnie z jego ścieżką/warstwą).
 4. Jeśli tego pliku nie da się sensownie utworzyć dla tej zmiany — odpowiedz DOKŁADNIE jednym
    słowem: BRAK_ZMIAN.\
+"""
+
+_REPAIR_FILE_SYSTEM = """\
+Jesteś senior developerem naprawiającym wygenerowaną zmianę po lokalnej walidacji.
+Otrzymasz pełną treść jednego pliku, zestaw pozostałych plików zmiany oraz dokładny log błędu.
+
+Zasady:
+1. Najpierw ustal z LOGU WALIDACJI, czy wskazany plik jest przyczyną błędu.
+2. Jeśli tak, zwróć WYŁĄCZNIE pełną poprawioną treść tego pliku — bez markdown i wyjaśnień.
+3. Zachowaj żądaną funkcjonalność oraz spójność nazw/kontraktów z pozostałymi plikami.
+4. Nie maskuj błędu przez usuwanie funkcjonalności, wyłączanie testów ani pomijanie walidacji.
+5. Jeśli ten plik nie wymaga zmiany, odpowiedz DOKŁADNIE: BRAK_ZMIAN.\
 """
 
 
@@ -416,6 +513,7 @@ def generate_file_change(question: str, proposals: list[dict],
     )
     user_msg = (
         f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
+        f"{_CONSISTENCY_RULES}\n\n"
         f"PLIK: {file_path}\n```\n{file_source}\n```\n\n"
         f"ŻĄDANA ZMIANA: {question}\n"
         f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
@@ -447,18 +545,24 @@ def build_repo_map(chunks: list[CodeChunk]) -> str:
     return "\n".join(lines)
 
 
-def plan_change(question: str, repo_map: str, proposals: list[dict]) -> list[dict]:
+def plan_change(question: str, repo_map: str, proposals: list[dict],
+                retrieved_chunks: list[CodeChunk] | None = None) -> list[dict]:
     """LLM planuje pliki do zmiany/utworzenia w całej aplikacji (zamiast top-5 retrievalu).
 
-    Zwraca listę {repo, path, action: modify|create, reason}. Pusta lista przy błędzie
-    lub w trybie demo.
+    `repo_map` daje pełny zasięg aplikacji, a `retrieved_chunks` dostarcza rzeczywisty
+    kod związany z żądaniem. Zwraca listę {repo, path, action: modify|create, reason}.
+    Pusta lista przy błędzie lub w trybie demo.
     """
     props = "\n".join(
         f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or [])
     )
+    code_context = _build_context(retrieved_chunks or [])
     user_msg = (
         f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
+        f"{_CHANGE_PLAYBOOK}\n\n"
         f"MAPA REPOZYTORIÓW (istniejące pliki i symbole):\n{repo_map}\n\n"
+        f"TRAFNE FRAGMENTY RZECZYWISTEGO KODU (główne źródło decyzji):\n"
+        f"{code_context or '(brak trafnych fragmentów)'}\n\n"
         f"ŻĄDANA ZMIANA: {question}\n"
         f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
         f"Zwróć plan zmian jako JSON:"
@@ -500,6 +604,7 @@ def verify_completeness(question: str, proposals: list[dict], repo_map: str,
     props = "\n".join(f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or []))
     user_msg = (
         f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
+        f"{_CHANGE_PLAYBOOK}\n\n"
         f"MAPA REPOZYTORIÓW:\n{repo_map}\n\n"
         f"ŻĄDANA ZMIANA: {question}\n"
         f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
@@ -538,6 +643,7 @@ def generate_new_file(question: str, proposals: list[dict], repo: str, file_path
     )
     user_msg = (
         f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
+        f"{_CONSISTENCY_RULES}\n\n"
         f"NOWY PLIK DO UTWORZENIA: {repo}/{file_path}\n\n"
         f"ŻĄDANA ZMIANA: {question}\n"
         f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
@@ -545,6 +651,87 @@ def generate_new_file(question: str, proposals: list[dict], repo: str, file_path
     )
     result = _strip_fences(_call(_NEWFILE_SYSTEM, user_msg, max_tokens=4096))
     return "" if _is_no_change(result) else result
+
+
+def repair_file_change(question: str, proposals: list[dict], repo: str, file_path: str,
+                       current_content: str, validation_output: str,
+                       related_files: list[dict] | None = None) -> str:
+    """Repair one generated file using an exact local build/validation failure.
+
+    Returns the full corrected file, or "" when this file does not need a repair.
+    """
+    props = "\n".join(
+        f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or [])
+    )
+    related_sections: list[str] = []
+    related_budget = 24000
+    for related in (related_files or []):
+        related_repo = related.get("repo") or repo
+        related_path = related.get("path") or related.get("file_path") or ""
+        if related_repo == repo and related_path == file_path:
+            continue
+        content = related.get("content")
+        if content is None:
+            content = related.get("new_content") or ""
+        section = f"### {related_repo}/{related_path}\n{str(content)[:6000]}"
+        if related_budget - len(section) < 0:
+            break
+        related_sections.append(section)
+        related_budget -= len(section)
+    related_context = "\n\n".join(related_sections) or "(brak innych plików)"
+    failure_tail = (validation_output or "")[-16000:]
+    user_msg = (
+        f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
+        f"{_CONSISTENCY_RULES}\n\n"
+        f"ŻĄDANA ZMIANA: {question}\n"
+        f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
+        f"LOG WALIDACJI (źródło prawdy):\n{failure_tail}\n\n"
+        f"POZOSTAŁE PLIKI ZMIANY W TYM REPO:\n{related_context}\n\n"
+        f"PLIK DO OCENY I EWENTUALNEJ NAPRAWY: {repo}/{file_path}\n"
+        f"```\n{current_content}\n```\n\n"
+        f"Zwróć pełną poprawioną treść albo BRAK_ZMIAN:"
+    )
+    result = _strip_fences(_call(_REPAIR_FILE_SYSTEM, user_msg, max_tokens=4096))
+    return "" if _is_no_change(result) else result
+
+
+_EXPAND_SYSTEM = """\
+Jesteś pomocnikiem wyszukiwania kodu w systemie opisanym w KONTEKST SYSTEMU.
+Dostajesz pytanie w języku naturalnym (po polsku). Zwróć angielskie słowa-klucze
+i prawdopodobne identyfikatory w kodzie (nazwy klas / metod / pól / plików /
+tematów Kafka / kolumn), które warto wyszukać, by znaleźć odpowiedni kod.
+
+Odpowiedz WYŁĄCZNIE prawidłowym JSON (bez markdown, bez zdań):
+{"terms": ["Payment", "PaymentRequested", "payment-events", "calculateFee", "..."]}
+
+Zasady:
+- 8–20 termów, pojedyncze słowa/identyfikatory (NIE całe zdania).
+- Tłumacz pojęcia biznesowe z pytania na angielskie terminy techniczne
+  (np. "opłata"->fee/charge, "zamówienie"->order, "magazyn"->inventory/stock,
+  "płatność"->payment, "powiadomienie"->notification, "anulowanie"->cancel).
+- Uwzględnij nazwy serwisów/tematów z KONTEKSTU SYSTEMU, jeśli pasują.\
+"""
+
+
+def expand_query(question: str) -> list[str]:
+    """NL (PL) → lista angielskich haseł/identyfikatorów do wyszukiwania.
+
+    Domyka lukę słownikową między polskim pytaniem a angielskim kodem. Tanie
+    wywołanie (light=bez rozumowania). Pusta lista przy błędzie/braku klucza —
+    wtedy keyword_search działa na samym pytaniu (degradacja łagodna).
+    """
+    user_msg = f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\nPYTANIE: {question}\n\nZwróć JSON z termami:"
+    try:
+        data = _extract_json(_call(_EXPAND_SYSTEM, user_msg, max_tokens=400, light=True))
+    except Exception:
+        return []
+    terms = data.get("terms") or []
+    out: list[str] = []
+    for t in terms:
+        s = str(t).strip()
+        if s and s.lower() not in {x.lower() for x in out}:
+            out.append(s)
+    return out[:30]
 
 
 def run_qa(question: str, repo_path: str = "", chunks: list[CodeChunk] | None = None, **_kwargs) -> dict:
@@ -555,7 +742,10 @@ def run_qa(question: str, repo_path: str = "", chunks: list[CodeChunk] | None = 
     Gdy `chunks` podany używa go bezpośrednio, inaczej indeksuje `repo_path`.
     """
     all_chunks = chunks if chunks is not None else ingest_repo(repo_path)
-    relevant_chunks = keyword_search(all_chunks, question, top_k=5)
+    # Ekspansja zapytania (NL PL → angielskie identyfikatory w kodzie) domyka lukę
+    # słownikową pytanie↔kod; wynik zasila leksykalne keyword_search.
+    extra_terms = expand_query(question)
+    relevant_chunks = keyword_search(all_chunks, question, top_k=8, extra_terms=extra_terms)
 
     if not relevant_chunks:
         return {

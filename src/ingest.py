@@ -226,6 +226,42 @@ def parse_js_file(filepath: Path, repo_root: Path) -> list[CodeChunk]:
     return chunks
 
 
+# ── Config / schema / build (whole-file chunk) ────────────────────────────────
+# Zmiany w tym systemie prawie zawsze dotykają plików innych niż źródła: migracje
+# Flyway (.sql), application.yml, build.gradle, package.json, kontrakty zdarzeń.
+# Bez ich indeksowania planner ich „nie widzi" i nie potrafi ich wskazać do zmiany.
+# Traktujemy taki plik jako JEDEN chunk (symbol = nazwa pliku) — wystarcza, by
+# trafił do mapy repo i do wyszukiwania.
+_CONFIG_SUFFIXES = (".yml", ".yaml", ".sql", ".gradle", ".kts",
+                    ".properties", ".json", ".conf", ".xml")
+_SKIP_CONFIG_FILES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
+    "gradle.lockfile", "tsconfig.tsbuildinfo",
+}
+_MAX_CONFIG_BYTES = 256_000
+_MAX_CONFIG_LINES = 800
+
+
+def parse_config_file(filepath: Path, repo_root: Path) -> list[CodeChunk]:
+    if filepath.name.lower() in _SKIP_CONFIG_FILES:
+        return []
+    try:
+        if filepath.stat().st_size > _MAX_CONFIG_BYTES:
+            return []
+        text = filepath.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if not text.strip():
+        return []
+    lines = text.splitlines()
+    rel_path = str(filepath.relative_to(repo_root))
+    src = text if len(lines) <= _MAX_CONFIG_LINES else "\n".join(lines[:_MAX_CONFIG_LINES])
+    return [CodeChunk(
+        file_path=rel_path, symbol=filepath.name,
+        start_line=1, end_line=len(lines), source=src,
+    )]
+
+
 # ── Dispatcher ──────────────────────────────────────────────────────────────
 _PARSERS = {
     ".py": parse_python_file,
@@ -235,6 +271,7 @@ _PARSERS = {
     ".ts": parse_js_file,
     ".tsx": parse_js_file,
     ".mjs": parse_js_file,
+    **{suffix: parse_config_file for suffix in _CONFIG_SUFFIXES},
 }
 
 

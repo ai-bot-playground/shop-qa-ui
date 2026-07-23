@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
-"""check_endpoints.py — diagnostyka łączności z modelem przez Azure AI Foundry.
+"""check_endpoints.py — diagnostyka łączności z modelem LLM (OpenRouter).
 
-Sprawdza endpoint używany przez aplikację, czytając te same zmienne env co
-diagnostyczna sekcja .env.docker.example:
+Sprawdza DOKŁADNIE tę samą ścieżkę LLM, której używa aplikacja (src/agent.py):
+  OpenRouter chat/completions, model = OPENROUTER_MODEL,
+  auth: Bearer OPENROUTER_API_KEY.
 
-  - MOCNY (AKTYWNY): {AZURE_AI_ENDPOINT}/v1/messages
-        model = AZURE_AI_DEPLOYMENT (np. claude-opus-4-8), auth: Bearer AZURE_AI_API_KEY
-
-Aktywna ścieżka LLM w aplikacji to OpenRouter (OPENROUTER_API_KEY).
-Ten skrypt służy do weryfikacji łączności z Azure AI Foundry jako alternatywą.
-
-Uruchom WEWNĄTRZ kontenera (te same klucze/sieć co aplikacja):
-  podman exec --env PYTHONUTF8=1 <kontener> python scripts/check_endpoints.py
+Uruchom lokalnie (host) lub w kontenerze — czyta te same zmienne env co aplikacja:
+  python scripts/check_endpoints.py
 
 Exit code: 0 = OK, 1 = błąd.
 """
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
+try:
+    from dotenv import load_dotenv
+
+    # .env leży w katalogu shop-qa-ui (rodzic katalogu scripts/).
+    _here = os.path.dirname(os.path.abspath(__file__))
+    load_dotenv(os.path.join(_here, "..", ".env"))
+except Exception:
+    pass  # dotenv opcjonalny — env może już być ustawiony w powłoce/kontenerze
+
+ENDPOINT = os.environ.get(
+    "OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1/chat/completions"
+)
+MODEL = os.environ.get("OPENROUTER_MODEL", "z-ai/glm-5.2")
+KEY = os.environ.get("OPENROUTER_API_KEY", "")
 PING = "Odpowiedz jednym słowem: pong"
 TIMEOUT = 60
 
@@ -28,38 +38,46 @@ def _mask(key: str) -> str:
     return f"...{key[-4:]} (len {len(key)})" if key else "(BRAK)"
 
 
-def _post(url: str, headers: dict, payload: dict) -> tuple[int, str]:
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, headers=headers)
+def check_openrouter() -> bool:
+    print(f"\n[OpenRouter] {MODEL}  →  {ENDPOINT}")
+    print(f"      klucz OPENROUTER_API_KEY: {_mask(KEY)}")
+    if not KEY:
+        print("      ⛔ POMINIĘTO — brak OPENROUTER_API_KEY")
+        return False
+
+    payload = {
+        "model": MODEL,
+        "max_tokens": 64,
+        # Ping bez rozumowania — inaczej przy effort=high cały krótki budżet
+        # zjadają tokeny reasoningu i `content` wraca pusty (HTTP 200, ale bez treści).
+        "reasoning": {"enabled": False},
+        "messages": [{"role": "user", "content": PING}],
+    }
+    req = urllib.request.Request(
+        ENDPOINT,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {KEY}",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            return r.status, r.read().decode("utf-8", "ignore")
+            status, body = r.status, r.read().decode("utf-8", "ignore")
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "ignore")
+        status, body = e.code, e.read().decode("utf-8", "ignore")
     except Exception as e:  # noqa: BLE001
-        return -1, f"{type(e).__name__}: {e}"
-
-
-def check_opus() -> bool:
-    endpoint = os.environ.get("AZURE_AI_ENDPOINT", "")
-    key = os.environ.get("AZURE_AI_API_KEY", "")
-    deployment = os.environ.get("AZURE_AI_DEPLOYMENT", "claude-opus-4-8")
-    print(f"\n[Azure AI Foundry] {deployment}  →  {endpoint}/v1/messages")
-    print(f"      klucz AZURE_AI_API_KEY: {_mask(key)}")
-    if not endpoint or not key:
-        print("      ⛔ POMINIĘTO — brak AZURE_AI_ENDPOINT lub AZURE_AI_API_KEY")
+        print(f"      ⛔ {type(e).__name__}: {e}")
         return False
-    status, body = _post(
-        endpoint.rstrip("/") + "/v1/messages",
-        {"Content-Type": "application/json", "Authorization": f"Bearer {key}",
-         "anthropic-version": "2023-06-01"},
-        {"model": deployment, "max_tokens": 16,
-         "messages": [{"role": "user", "content": PING}]},
-    )
+
     print(f"      HTTP {status}")
     if status == 200:
         try:
-            print(f"      ✅ odpowiedź: {json.loads(body)['content'][0]['text'].strip()!r}")
+            data = json.loads(body)
+            txt = (data["choices"][0]["message"].get("content") or "").strip()
+            print(f"      ✅ odpowiedź: {txt!r}")
+            if data.get("usage"):
+                print(f"      usage: {data['usage']}")
             return True
         except (KeyError, IndexError, ValueError):
             print(f"      ⚠️  200, nieoczekiwany kształt: {body[:300]}")
@@ -69,10 +87,10 @@ def check_opus() -> bool:
 
 
 def main() -> int:
-    print("=== Diagnostyka endpointów LLM (Azure AI Foundry) ===")
-    ok = check_opus()
+    print("=== Diagnostyka endpointu LLM (OpenRouter) ===")
+    ok = check_openrouter()
     print("\n=== Wynik ===")
-    print(f"  Azure AI Foundry: {'✅ OK' if ok else '⛔ FAIL'}")
+    print(f"  OpenRouter: {'✅ OK' if ok else '⛔ FAIL'}")
     return 0 if ok else 1
 
 
