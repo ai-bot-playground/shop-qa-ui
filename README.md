@@ -67,13 +67,25 @@ Pełny workflow uruchamiaj lokalnie z JDK 25, Node/npm i lokalnymi klonami `shop
 
 `Containerfile` nie zawiera JDK, Node, `gh` ani repozytoriów siostrzanych, a ConfigMap nie ustawia `SHOP_REPOS_DIR` — pod na `:8501` obsługuje więc **wyłącznie indeksowanie i analizę**. Lokalna walidacja i wystawianie PR-ów działają tylko w wariancie natywnym (`run-local.ps1`, port `8502`).
 
-### Znany bloker środowiskowy
+### Gradle: „Unable to establish loopback connection"
 
-Jeśli walidacja Gradle kończy się `java.io.IOException: Unable to establish loopback connection`, problem jest poza tym repozytorium — na tej maszynie `java.nio.channels.Selector.open()` nie potrafi zestawić pary socketów na loopbacku (dotyczy JDK 21 i 25, więc każdy build Gradle i każdy serwis na Netty). Aplikacja klasyfikuje to jako awarię **środowiska**, nie kodu, i nie wysyła takiego logu do LLM. Szybkie sprawdzenie:
+Komunikat myli — **nie chodzi o TCP loopback**. `Selector.open()` (którego Gradle potrzebuje do komunikacji z daemonem) tworzy pipe budzący na **gniazdie AF_UNIX** w `java.io.tmpdir`, a na zablokowanych korporacyjnie Windowsach `connect` na takim gnieździe w `%LOCALAPPDATA%\Temp` zwraca `SocketException: Invalid argument`. Zwykły zapis pliku i `bind` w tym katalogu działają — pada dopiero `connect`, i tylko w tym drzewie katalogów. To ta sama klasa problemu, którą obchodzi już [`_clone_base()`](src/sandbox.py) dla worktree gita.
+
+Obejście — jedna zmienna środowiskowa użytkownika, obejmuje każdy proces Javy (launcher Gradle'a, daemon, Testcontainers, Netty):
 
 ```bash
-echo 'try (var s = java.nio.channels.Selector.open()) { System.out.println("LOOPBACK OK"); } catch (Exception e) { System.out.println("FAIL: " + e); }' | jshell -q --execution local -
+setx JDK_JAVA_OPTIONS "-Djdk.net.unixdomain.tmpdir=C:\Windows\Temp"
 ```
+
+Sam `org.gradle.jvmargs` nie wystarcza — naprawia daemona, ale launcher ginie wtedy z `The first result from the daemon was empty`.
+
+Szybkie sprawdzenie, czy problem występuje:
+
+```bash
+echo 'try (var s = java.nio.channels.Selector.open()) { System.out.println("OK"); } catch (Exception e) { System.out.println("FAIL: " + e); }' | jshell -q --execution local -
+```
+
+Niezależnie od obejścia aplikacja klasyfikuje taki log jako awarię **środowiska**, nie kodu, i nie wysyła go do LLM.
 
 ---
 
