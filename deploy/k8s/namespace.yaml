@@ -1,6 +1,10 @@
+# Namespace `shop` — ten sam, w którym stoi reszta serwisów (unifikacja z commitu
+# 5718f1d). Plik NIE jest w `kustomization.yaml`: w klastrze preprod namespace
+# tworzy umbrella chart Helma, a ten manifest zostaje na wypadek samodzielnego
+# `kubectl apply` na czystym klastrze.
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: shop-qa-ui
+  name: shop
   labels:
-    app.kubernetes.io/part-of: shop-qa-ui
+    app.kubernetes.io/part-of: shop

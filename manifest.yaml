@@ -69,3 +69,7 @@ apps:
         role: "testy akceptacyjne e2e"
         lang: java
         indexable: true
+      - name: shop-token-metrics
+        role: "telemetria tokenów LLM (Micrometer → Prometheus)"
+        lang: java
+        indexable: false

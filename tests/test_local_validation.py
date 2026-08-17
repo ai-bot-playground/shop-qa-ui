@@ -64,6 +64,19 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual("environment", _validation_failure_kind(["npm", "ci"], output))
         self.assertEqual("code", _validation_failure_kind(["gradlew", "classes"], "error: ';' expected"))
 
+    def test_gradle_loopback_failure_is_environment_not_code(self):
+        # Realna awaria na tej maszynie: Selector.open() nie zestawia pary socketów
+        # na loopbacku, więc każdy build Gradle pada niezależnie od kodu.
+        output = (
+            "FAILURE: Build failed with an exception.\n\n* What went wrong:\n"
+            "java.io.IOException: Unable to establish loopback connection\n"
+        )
+
+        self.assertEqual(
+            "environment",
+            _validation_failure_kind(["gradlew.bat", "--offline", "classes"], output),
+        )
+
     def test_invalid_json_fails_before_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

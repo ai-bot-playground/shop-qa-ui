@@ -6,8 +6,9 @@ metadata:
   name: shop-qa-ui-config
   namespace: shop
 data:
-  # OpenRouter (OpenAI-compatible) — aktywna ścieżka LLM. Klucz API → secret
-  # (OPENROUTER_API_KEY). src/agent.py: dyspozytor OpenRouter → mock.
+  # OpenRouter (OpenAI-compatible) — jedyna aktywna ścieżka LLM. Klucz API →
+  # secret (OPENROUTER_API_KEY). Bez klucza wywołania kończą się 401; atrapę
+  # offline włącza jawnie QA_FAKE_LLM=1 (src/fake_llm.py).
   OPENROUTER_MODEL: "z-ai/glm-5.2"
   OPENROUTER_REASONING_EFFORT: "high"
   OPENROUTER_MAX_TOKENS: "32000"

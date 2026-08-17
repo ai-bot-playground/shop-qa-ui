@@ -8,17 +8,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import streamlit as st
 import pandas as pd
-from src.ingest import ingest_repo, ingest_app
+from src.ingest import ingest_app
 from src.agent import (
-    run_qa, generate_code_fix, fix_code_with_tests, generate_change_diff,
-    generate_file_change, plan_change, build_repo_map, generate_new_file,
-    verify_completeness, repair_file_change,
+    run_qa, generate_file_change, plan_change, build_repo_map, generate_new_file,
+    verify_completeness, repair_file_change, _fake_llm_enabled,
 )
 from src.sandbox import (
     compute_diff, open_pr_for_files, pr_checks, merge_pr,
     pr_failure_summary, validate_file_changes, validation_passed_for_repos,
 )
-from src.answer_types import ANSWER_TYPES, get_default_templates
 
 
 def _lang_for(path: str) -> str:
@@ -94,10 +92,6 @@ if "active_session_id" not in st.session_state:
     st.session_state.active_session_id = st.session_state.sessions[0]["id"]
 if "active_tab" not in st.session_state:
     st.session_state.active_tab = "ready"
-if "answer_templates" not in st.session_state:
-    st.session_state.answer_templates = get_default_templates()
-if "answer_mode" not in st.session_state:
-    st.session_state.answer_mode = "business"
 
 def _active_session() -> dict:
     sid = st.session_state.active_session_id
@@ -299,8 +293,12 @@ with st.sidebar:
                 for m in sess["messages"][-3:]:
                     st.caption(f"↳ {m['question'][:50]}…")
 
-    _active_model = os.environ.get("OPENROUTER_MODEL", "z-ai/glm-5.2")
-    st.caption(f"🟢 {_active_model}")
+    # W trybie offline żadne wywołanie nie idzie do modelu — badge musi to mówić
+    # wprost, inaczej łatwo wziąć odpowiedzi atrapy za odpowiedzi GLM-a.
+    if _fake_llm_enabled():
+        st.caption("🟡 atrapa offline (QA_FAKE_LLM=1) — bez wywołań modelu")
+    else:
+        st.caption(f"🟢 {os.environ.get('OPENROUTER_MODEL', 'z-ai/glm-5.2')}")
 
 # ── Sync query params → session state (stepper link navigation) ───────────────
 if "step" in st.query_params:
@@ -410,15 +408,40 @@ if active_tab == "ready":
 
     if st.session_state.get("chunks"):
         chunks = st.session_state.chunks
-        st.success(f"✅ Repozytorium zaindeksowane — {len(chunks)} symboli gotowych do analizy.")
-        col1, col2 = st.columns(2)
-        for i, c in enumerate(chunks):
-            (col1 if i % 2 == 0 else col2).info(f"**{c.symbol}**  \n`{c.file_path}:{c.start_line}`")
+        st.success(f"✅ Aplikacja zaindeksowana — {len(chunks)} symboli gotowych do analizy.")
+
+        # Podsumowanie per repo, NIE jeden widget na symbol: przy 8 repo lista
+        # symboli to tysiące `st.info`, co zamrażało cały krok 1 na kilkadziesiąt
+        # sekund. Szczegóły są w jednej tabeli, rozwijanej na żądanie.
+        per_repo: dict[str, int] = {}
+        per_repo_files: dict[str, set] = {}
+        for c in chunks:
+            repo = c.repo or "(root)"
+            per_repo[repo] = per_repo.get(repo, 0) + 1
+            per_repo_files.setdefault(repo, set()).add(c.file_path)
+
+        cols = st.columns(min(4, max(1, len(per_repo))))
+        for i, repo in enumerate(sorted(per_repo)):
+            cols[i % len(cols)].metric(
+                repo, per_repo[repo], f"{len(per_repo_files[repo])} plików",
+                delta_color="off",
+            )
+
+        with st.expander(f"Szczegóły — wszystkie {len(chunks)} symboli"):
+            st.dataframe(
+                pd.DataFrame([
+                    {"Repo": c.repo, "Symbol": c.symbol, "Plik": c.file_path,
+                     "Linie": f"{c.start_line}–{c.end_line}"}
+                    for c in chunks
+                ]),
+                use_container_width=True, hide_index=True,
+            )
+
         st.markdown("")
         if st.button("Przejdź dalej →", type="primary"):
             _advance()
     else:
-        st.info("Użyj panelu bocznego: wpisz ścieżkę do repozytorium i kliknij **⚡ Indeksuj repozytorium**.")
+        st.info("Użyj panelu bocznego: wybierz aplikację i kliknij **⚡ Indeksuj aplikację**.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # KROK 2 — Analyze
@@ -625,15 +648,8 @@ elif active_tab == "analyze":
                         ):
                             item["accepted_proposal_indices"] = [rec_idx]
                             item["accepted_commit_hints"] = [rec["commit_hint"]]
-                            st.session_state.sandbox_preload_symbol = chunks_item[0].symbol
                             st.session_state.sandbox_accepted_proposals = [rec]
                             st.session_state.sandbox_question = item["question"]
-                            st.session_state.sandbox_generated_code = None
-                            st.session_state.sandbox_code_version = 0
-                            st.session_state.sandbox_diff = None
-                            st.session_state.sandbox_newfile = None
-                            st.session_state.sandbox_error = None
-                            st.session_state.sandbox_chunks = chunks_item
                             st.session_state.sandbox_preload_chunks = chunks_item
                             st.session_state.sandbox_multi_changes = None
                             st.session_state.sandbox_plan = None
@@ -642,17 +658,10 @@ elif active_tab == "analyze":
                         for j in accepted_indices:
                             st.success(f"✅ {proposals[j]['title']}")
                         if chunks_item and st.button("Przejdź dalej →", key=f"next_{i}", type="primary"):
-                            st.session_state.sandbox_preload_symbol = chunks_item[0].symbol
                             st.session_state.sandbox_accepted_proposals = [
                                 proposals[j] for j in accepted_indices
                             ]
                             st.session_state.sandbox_question = item["question"]
-                            st.session_state.sandbox_generated_code = None
-                            st.session_state.sandbox_code_version = 0
-                            st.session_state.sandbox_diff = None
-                            st.session_state.sandbox_newfile = None
-                            st.session_state.sandbox_error = None
-                            st.session_state.sandbox_chunks = chunks_item
                             st.session_state.sandbox_preload_chunks = chunks_item
                             st.session_state.sandbox_multi_changes = None
                             st.session_state.sandbox_plan = None
@@ -668,452 +677,470 @@ elif active_tab == "sandbox":
     if "chunks" not in st.session_state:
         st.info("Najpierw zaindeksuj repozytorium w panelu bocznym.")
     else:
-        symbol = st.session_state.get("sandbox_preload_symbol")
         question = st.session_state.get("sandbox_question", "")
         accepted_proposals = st.session_state.get("sandbox_accepted_proposals", [])
+        # Chunki trafione w Analyze — źródło prawdy dla kroku 3. Wcześniej krok 3
+        # dostawał tylko NAZWĘ symbolu i odszukiwał go przez `c.symbol == symbol`
+        # po wszystkich repo: pospolita nazwa (`build.gradle`, `apply`, `handle`)
+        # trafiała w losowe repo/plik. Chunk niesie już repo i ścieżkę, więc
+        # przekazujemy obiekt, nie napis.
+        preload_chunks = st.session_state.get("sandbox_preload_chunks") or []
 
-        if not symbol:
+        if not preload_chunks:
             st.info("Wróć do kroku Analyze, zadaj pytanie i zaakceptuj propozycję zmian.")
         else:
-            chunks = st.session_state.chunks
-            chunk = next((c for c in chunks if c.symbol == symbol), None)
+            chunk = preload_chunks[0]
 
-            if not chunk:
-                st.warning(f"Nie znaleziono funkcji '{symbol}' w zaindeksowanym kodzie.")
-            else:
-                # ── Ścieżka serwisu sklepu (Java/JS/TS/…): pełny plik → diff (git) → PR → bramka ──
-                # Obsługuje zarówno single-repo jak i multi-repo (wszystkie chunki z wyników wyszukiwania).
-                if not chunk.file_path.endswith(".py"):
-                    if question:
-                        st.markdown(
-                            f"<div style='background:#f0f4ff;border-left:4px solid #6366f1;"
-                            f"padding:10px 16px;border-radius:4px;margin-bottom:12px'>"
-                            f"<span style='font-size:12px;color:#6366f1;font-weight:600'>ŻĄDANA ZMIANA</span><br/>"
-                            f"{question}</div>",
-                            unsafe_allow_html=True,
-                        )
-                    for p in accepted_proposals:
-                        st.caption(f"✅ {p['title']} — {p['description']}")
+            # ── Jedna ścieżka dla wszystkich serwisów: pełny plik → diff (git)
+            # → walidacja lokalna → PR → bramka. Pliki `.py` odfiltrowuje już
+            # filtr per-cel niżej, więc nie ma tu osobnej gałęzi. ──
+            if question:
+                st.markdown(
+                    f"<div style='background:#f0f4ff;border-left:4px solid #6366f1;"
+                    f"padding:10px 16px;border-radius:4px;margin-bottom:12px'>"
+                    f"<span style='font-size:12px;color:#6366f1;font-weight:600'>ŻĄDANA ZMIANA</span><br/>"
+                    f"{question}</div>",
+                    unsafe_allow_html=True,
+                )
+            for p in accepted_proposals:
+                st.caption(f"✅ {p['title']} — {p['description']}")
 
-                    repo_paths = st.session_state.get("repo_paths", {})
+            repo_paths = st.session_state.get("repo_paths", {})
 
-                    # ── Krok planowania: LLM wskazuje pliki do zmiany/utworzenia w CAŁEJ aplikacji
-                    # (na bazie mapy wszystkich repo), zamiast ślepego top-5 z retrievalu. ──
-                    if st.session_state.get("sandbox_plan") is None:
-                        with st.spinner("Planuję zmianę w całej aplikacji (które pliki zmienić/utworzyć)…"):
-                            repo_map = build_repo_map(st.session_state.get("chunks", []))
-                            st.session_state.sandbox_plan = plan_change(
-                                question, repo_map, accepted_proposals,
-                                st.session_state.get("sandbox_preload_chunks") or [],
-                            )
-                        st.rerun()
-
-                    plan = st.session_state.get("sandbox_plan") or []
-                    seen_keys: set = set()
-                    targets: list[dict] = []
-                    for pf in plan:
-                        repo, path, action = pf["repo"], pf["path"], pf["action"]
-                        if repo not in repo_paths or path.endswith(".py"):
-                            continue
-                        if (repo, path) in seen_keys:
-                            continue
-                        seen_keys.add((repo, path))
-                        rpath = repo_paths[repo]
-                        orig = ""
-                        if action == "modify":
-                            try:
-                                with open(os.path.join(rpath, path), encoding="utf-8") as _f:
-                                    orig = _f.read()
-                            except OSError:
-                                action = "create"  # plik z planu nie istnieje → utwórz
-                        targets.append({
-                            "repo": repo, "file_path": path, "action": action,
-                            "original": orig, "repo_path": rpath,
-                            "reason": pf.get("reason", ""),
-                        })
-
-                    # Fallback: planner nic nie zwrócił → użyj plików z retrievalu (stare zachowanie).
-                    if not targets:
-                        st.warning("Planner nie zwrócił plików — używam wyników wyszukiwania jako kandydatów.")
-                        for c in (st.session_state.get("sandbox_preload_chunks") or [chunk]):
-                            if c.file_path.endswith(".py") or c.repo not in repo_paths:
-                                continue
-                            if (c.repo, c.file_path) in seen_keys:
-                                continue
-                            seen_keys.add((c.repo, c.file_path))
-                            rpath = repo_paths.get(c.repo, "")
-                            try:
-                                with open(os.path.join(rpath, c.file_path), encoding="utf-8") as _f:
-                                    orig = _f.read()
-                            except OSError:
-                                orig = c.source
-                            targets.append({"repo": c.repo, "file_path": c.file_path, "action": "modify",
-                                             "original": orig, "repo_path": rpath, "reason": ""})
-
-                    n_repos = len({t["repo"] for t in targets})
-                    n_files = len(targets)
-                    n_new = sum(1 for t in targets if t["action"] == "create")
-                    st.caption(
-                        f"Plan: {n_files} plik(ów) w {n_repos} repo · {n_new} nowych · base `main`"
+            # ── Krok planowania: LLM wskazuje pliki do zmiany/utworzenia w CAŁEJ aplikacji
+            # (na bazie mapy wszystkich repo), zamiast ślepego top-5 z retrievalu. ──
+            if st.session_state.get("sandbox_plan") is None:
+                with st.spinner("Planuję zmianę w całej aplikacji (które pliki zmienić/utworzyć)…"):
+                    repo_map = build_repo_map(st.session_state.get("chunks", []))
+                    st.session_state.sandbox_plan = plan_change(
+                        question, repo_map, accepted_proposals,
+                        st.session_state.get("sandbox_preload_chunks") or [],
                     )
-                    with st.expander("📋 Plan zmian", expanded=True):
-                        if not targets:
-                            st.info("Brak plików do zmiany.")
-                        for t in targets:
-                            tag = "🆕 utwórz" if t["action"] == "create" else "✏️ zmień"
-                            st.markdown(
-                                f"- {tag} `{t['repo']}/{t['file_path']}`"
-                                + (f" — {t['reason']}" if t.get("reason") else "")
-                            )
+                st.rerun()
 
-                    # Inicjuj lub przywróć stan zmian per-plik.
-                    if st.session_state.get("sandbox_multi_changes") is None:
-                        st.session_state.sandbox_multi_changes = [
-                            {**t, "new_content": None, "diff": None, "error": None, "pr_result": None}
-                            for t in targets
-                        ]
-                        st.session_state.sandbox_test_results = {}  # nowe zmiany → testy nieaktualne
-                        st.session_state.sandbox_validation_results = {}
-                        st.session_state.sandbox_verify = None       # i weryfikacja nieaktualna
-                    multi = st.session_state.sandbox_multi_changes
+            plan = st.session_state.get("sandbox_plan") or []
+            seen_keys: set = set()
+            targets: list[dict] = []
+            for pf in plan:
+                repo, path, action = pf["repo"], pf["path"], pf["action"]
+                if repo not in repo_paths or path.endswith(".py"):
+                    continue
+                if (repo, path) in seen_keys:
+                    continue
+                seen_keys.add((repo, path))
+                rpath = repo_paths[repo]
+                orig = ""
+                if action == "modify":
+                    try:
+                        with open(os.path.join(rpath, path), encoding="utf-8") as _f:
+                            orig = _f.read()
+                    except OSError:
+                        action = "create"  # plik z planu nie istnieje → utwórz
+                targets.append({
+                    "repo": repo, "file_path": path, "action": action,
+                    "original": orig, "repo_path": rpath,
+                    "reason": pf.get("reason", ""),
+                })
 
-                    # Generuj zmiany dla plików bez wygenerowanej treści.
-                    to_gen = [mc for mc in multi if mc["new_content"] is None]
-                    if to_gen:
-                        st.session_state.sandbox_validation_results = {}
-                        with st.spinner(f"Generuję zmiany dla {len(to_gen)}/{len(multi)} pliku/plików…"):
-                            for mc in to_gen:
-                                try:
-                                    if mc.get("action") == "create":
-                                        gen = generate_new_file(
-                                            question, accepted_proposals,
-                                            mc["repo"], mc["file_path"],
-                                        ) or ""
-                                    else:
-                                        gen = generate_file_change(
-                                            question, accepted_proposals,
-                                            mc["file_path"], mc["original"],
-                                        ) or ""
-                                    mc["new_content"] = gen
-                                    # Pusta treść z modelu = BRAK zmiany, nie usunięcie pliku.
-                                    # Bez tego compute_diff(original, "") dałby diff kasujący
-                                    # cały plik i trafiłby do PR-a.
-                                    mc["diff"] = (
-                                        compute_diff(mc["original"], gen, mc["file_path"])
-                                        if gen.strip() else ""
-                                    )
-                                    mc["error"] = None
-                                except Exception as exc:
-                                    mc["new_content"] = ""
-                                    mc["diff"] = ""
-                                    mc["error"] = str(exc)
-                        st.rerun()
+            # Fallback: planner nic nie zwrócił → użyj plików z retrievalu (stare zachowanie).
+            if not targets:
+                st.warning("Planner nie zwrócił plików — używam wyników wyszukiwania jako kandydatów.")
+                for c in (st.session_state.get("sandbox_preload_chunks") or [chunk]):
+                    if c.file_path.endswith(".py") or c.repo not in repo_paths:
+                        continue
+                    if (c.repo, c.file_path) in seen_keys:
+                        continue
+                    seen_keys.add((c.repo, c.file_path))
+                    rpath = repo_paths.get(c.repo, "")
+                    try:
+                        with open(os.path.join(rpath, c.file_path), encoding="utf-8") as _f:
+                            orig = _f.read()
+                    except OSError:
+                        orig = c.source
+                    targets.append({"repo": c.repo, "file_path": c.file_path, "action": "modify",
+                                     "original": orig, "repo_path": rpath, "reason": ""})
 
-                    # Pokaż diff per-plik.
-                    has_any_diff = any((mc.get("diff") or "").strip() for mc in multi)
-                    for mc in multi:
-                        diff_str = mc.get("diff") or ""
-                        tag = "🆕 " if mc.get("action") == "create" else ""
-                        label = f"{tag}`{mc['repo']}/{mc['file_path']}`"
-                        with st.expander(label, expanded=bool(diff_str.strip())):
-                            if mc.get("error"):
-                                st.error(f"Błąd LLM: {mc['error']}")
-                            elif not (mc.get("new_content") or "").strip():
-                                st.warning(
-                                    f"Model zwrócił pustą treść dla `{mc['file_path']}` "
-                                    f"(serwis **{mc['repo']}**)."
-                                )
-                            elif not diff_str.strip():
-                                st.warning("Wygenerowana treść identyczna z oryginałem (brak zmian).")
-                            else:
-                                st.code(diff_str, language="diff")
-                                with st.expander("Pełna nowa treść"):
-                                    st.code(mc["new_content"], language=_lang_for(mc["file_path"]))
-
-                    # ── Kompletność: licznik + ponów puste + agent-recenzent ──
-                    produced = [mc for mc in multi if (mc.get("new_content") or "").strip()]
-                    empty = [
-                        mc for mc in multi
-                        if not (mc.get("new_content") or "").strip() and not mc.get("error")
-                    ]
-                    st.markdown("---")
-                    st.caption(
-                        f"Wygenerowano treść: **{len(produced)}/{len(multi)}** plików"
-                        + (f" · **{len(empty)}** pustych (model nie wygenerował)" if empty else "")
+            n_repos = len({t["repo"] for t in targets})
+            n_files = len(targets)
+            n_new = sum(1 for t in targets if t["action"] == "create")
+            st.caption(
+                f"Plan: {n_files} plik(ów) w {n_repos} repo · {n_new} nowych · base `main`"
+            )
+            with st.expander("📋 Plan zmian", expanded=True):
+                if not targets:
+                    st.info("Brak plików do zmiany.")
+                for t in targets:
+                    tag = "🆕 utwórz" if t["action"] == "create" else "✏️ zmień"
+                    st.markdown(
+                        f"- {tag} `{t['repo']}/{t['file_path']}`"
+                        + (f" — {t['reason']}" if t.get("reason") else "")
                     )
-                    if empty:
-                        st.warning(
-                            "Część zaplanowanych plików wróciła pusta — model uznał je za nieistotne "
-                            "albo nie poradził sobie z treścią. Możesz ponowić ich generowanie."
-                        )
-                        if st.button("♻️ Ponów generowanie pustych", use_container_width=True):
-                            for mc in empty:
-                                mc["new_content"] = None  # pętla generowania wygeneruje je ponownie
-                            st.session_state.sandbox_validation_results = {}
-                            st.rerun()
 
-                    with st.expander("🔍 Weryfikacja kompletności (agent-recenzent)",
-                                     expanded=bool(empty)):
-                        st.caption(
-                            "Agent sprawdza, czy wygenerowany zestaw plików wystarcza, by zmiana "
-                            "działała end-to-end (czy nie brakuje plików, do których odwołuje się kod)."
-                        )
-                        if st.button("Sprawdź kompletność zmiany", use_container_width=True):
-                            gen_files = [
-                                {
-                                    "repo": mc["repo"], "path": mc["file_path"],
-                                    "action": mc.get("action", "modify"),
-                                    "status": "ok" if (mc.get("new_content") or "").strip() else "empty",
-                                    "head": "\n".join((mc.get("new_content") or "").splitlines()[:15]),
-                                }
-                                for mc in multi
-                            ]
-                            with st.spinner("Agent weryfikuje kompletność zestawu plików…"):
-                                st.session_state.sandbox_verify = verify_completeness(
+            # Inicjuj lub przywróć stan zmian per-plik.
+            if st.session_state.get("sandbox_multi_changes") is None:
+                st.session_state.sandbox_multi_changes = [
+                    {**t, "new_content": None, "diff": None, "error": None, "pr_result": None}
+                    for t in targets
+                ]
+                st.session_state.sandbox_test_results = {}  # nowe zmiany → testy nieaktualne
+                st.session_state.sandbox_validation_results = {}
+                st.session_state.sandbox_verify = None       # i weryfikacja nieaktualna
+            multi = st.session_state.sandbox_multi_changes
+
+            # Generuj zmiany dla plików bez wygenerowanej treści.
+            to_gen = [mc for mc in multi if mc["new_content"] is None]
+            if to_gen:
+                st.session_state.sandbox_validation_results = {}
+                with st.spinner(f"Generuję zmiany dla {len(to_gen)}/{len(multi)} pliku/plików…"):
+                    for mc in to_gen:
+                        try:
+                            if mc.get("action") == "create":
+                                gen = generate_new_file(
                                     question, accepted_proposals,
-                                    build_repo_map(st.session_state.get("chunks", [])),
-                                    gen_files,
-                                )
-                            st.rerun()
-
-                        verdict = st.session_state.get("sandbox_verify")
-                        if verdict:
-                            if verdict["complete"]:
-                                st.success("✅ Agent: zestaw plików wygląda na kompletny.")
+                                    mc["repo"], mc["file_path"],
+                                ) or ""
                             else:
-                                st.warning(f"⚠️ Agent: zestaw niekompletny. {verdict.get('notes', '')}")
-                            if verdict.get("missing"):
-                                st.markdown("**Brakujące / do uzupełnienia pliki:**")
-                                for m in verdict["missing"]:
-                                    tag = "🆕 utwórz" if m["action"] == "create" else "✏️ zmień"
-                                    st.markdown(
-                                        f"- {tag} `{m['repo']}/{m['path']}`"
-                                        + (f" — {m['reason']}" if m.get("reason") else "")
-                                    )
-                                if st.button("➕ Dodaj brakujące do planu i wygeneruj",
-                                             type="primary", use_container_width=True):
-                                    repo_paths = st.session_state.get("repo_paths", {})
-                                    existing = {(mc["repo"], mc["file_path"]) for mc in multi}
-                                    added = 0
-                                    for m in verdict["missing"]:
-                                        if (m["repo"] not in repo_paths
-                                                or (m["repo"], m["path"]) in existing
-                                                or m["path"].endswith(".py")):
-                                            continue
-                                        rpath = repo_paths[m["repo"]]
-                                        action, orig = m["action"], ""
-                                        if action == "modify":
-                                            try:
-                                                with open(os.path.join(rpath, m["path"]), encoding="utf-8") as _f:
-                                                    orig = _f.read()
-                                            except OSError:
-                                                action = "create"
-                                        multi.append({
-                                            "repo": m["repo"], "file_path": m["path"], "action": action,
-                                            "original": orig, "repo_path": rpath, "reason": m.get("reason", ""),
-                                            "new_content": None, "diff": None, "error": None, "pr_result": None,
-                                        })
-                                        added += 1
-                                    st.session_state.sandbox_verify = None
-                                    st.session_state.sandbox_test_results = {}
-                                    st.session_state.sandbox_validation_results = {}
-                                    if added:
-                                        st.toast(f"Dodano {added} plik(ów) do planu — generuję…")
-                                    st.rerun()
+                                gen = generate_file_change(
+                                    question, accepted_proposals,
+                                    mc["file_path"], mc["original"],
+                                ) or ""
+                            mc["new_content"] = gen
+                            # Pusta treść z modelu = BRAK zmiany, nie usunięcie pliku.
+                            # Bez tego compute_diff(original, "") dałby diff kasujący
+                            # cały plik i trafiłby do PR-a.
+                            mc["diff"] = (
+                                compute_diff(mc["original"], gen, mc["file_path"])
+                                if gen.strip() else ""
+                            )
+                            mc["error"] = None
+                        except Exception as exc:
+                            mc["new_content"] = ""
+                            mc["diff"] = ""
+                            mc["error"] = str(exc)
+                st.rerun()
 
-                    # ── Lokalna bramka przed PR: worktree → build → log → naprawa → build ──
-                    changed_by_repo: dict[str, list[dict]] = {}
-                    for mc in multi:
-                        if (mc.get("diff") or "").strip() and (mc.get("new_content") or "").strip():
-                            changed_by_repo.setdefault(mc["repo"], []).append(mc)
+            # Pokaż diff per-plik.
+            has_any_diff = any((mc.get("diff") or "").strip() for mc in multi)
+            for mc in multi:
+                diff_str = mc.get("diff") or ""
+                tag = "🆕 " if mc.get("action") == "create" else ""
+                label = f"{tag}`{mc['repo']}/{mc['file_path']}`"
+                with st.expander(label, expanded=bool(diff_str.strip())):
+                    if mc.get("error"):
+                        st.error(f"Błąd LLM: {mc['error']}")
+                    elif not (mc.get("new_content") or "").strip():
+                        st.warning(
+                            f"Model zwrócił pustą treść dla `{mc['file_path']}` "
+                            f"(serwis **{mc['repo']}**)."
+                        )
+                    elif not diff_str.strip():
+                        st.warning("Wygenerowana treść identyczna z oryginałem (brak zmian).")
+                    else:
+                        st.code(diff_str, language="diff")
+                        with st.expander("Pełna nowa treść"):
+                            st.code(mc["new_content"], language=_lang_for(mc["file_path"]))
 
-                    st.markdown("---")
-                    st.markdown("### Walidacja lokalna przed PR")
-                    st.caption(
-                        "Zmiany są nakładane w odłączonym worktree. Gradle kompiluje kod i testy "
-                        "w trybie offline; nie uruchamiamy Testcontainers, usług, PR-ów ani preprod."
-                    )
-                    if st.button(
-                        "▶ Uruchom walidację wszystkich zmienionych repo",
-                        use_container_width=True,
-                        disabled=not changed_by_repo,
-                    ):
-                        validation_results: dict = {}
-                        with st.spinner(f"Waliduję {len(changed_by_repo)} repozytorium/repozytoria…"):
-                            for repo, repo_changes in changed_by_repo.items():
-                                validation_results[repo] = validate_file_changes(
-                                    repo_changes,
-                                    repo_changes[0]["repo_path"],
-                                )
-                        st.session_state.sandbox_validation_results = validation_results
-                        st.rerun()
+            # ── Kompletność: licznik + ponów puste + agent-recenzent ──
+            produced = [mc for mc in multi if (mc.get("new_content") or "").strip()]
+            empty = [
+                mc for mc in multi
+                if not (mc.get("new_content") or "").strip() and not mc.get("error")
+            ]
+            st.markdown("---")
+            st.caption(
+                f"Wygenerowano treść: **{len(produced)}/{len(multi)}** plików"
+                + (f" · **{len(empty)}** pustych (model nie wygenerował)" if empty else "")
+            )
+            if empty:
+                st.warning(
+                    "Część zaplanowanych plików wróciła pusta — model uznał je za nieistotne "
+                    "albo nie poradził sobie z treścią. Możesz ponowić ich generowanie."
+                )
+                if st.button("♻️ Ponów generowanie pustych", use_container_width=True):
+                    for mc in empty:
+                        mc["new_content"] = None  # pętla generowania wygeneruje je ponownie
+                    st.session_state.sandbox_validation_results = {}
+                    st.rerun()
 
-                    validation_results = st.session_state.get("sandbox_validation_results") or {}
-                    failed_repos: list[str] = []
-                    repairable_repos: list[str] = []
-                    for repo, repo_changes in changed_by_repo.items():
-                        validation = validation_results.get(repo)
-                        if not validation:
-                            st.info(f"⏳ `{repo}` — oczekuje na walidację.")
-                            continue
-                        if validation.get("success"):
-                            check_kind = "build projektu" if validation.get("project_check") else "kontrola statyczna"
-                            st.success(f"✅ `{repo}` — {check_kind} zakończony pomyślnie.")
-                        else:
-                            failed_repos.append(repo)
-                            st.error(f"❌ `{repo}` — {validation.get('error', 'walidacja nieudana')}")
-                            if validation.get("failure_kind") == "environment":
-                                st.info(
-                                    "To problem środowiska lub brak zależności offline, nie błąd "
-                                    "wygenerowanego kodu. Uzupełnij lokalne zależności i ponów walidację."
-                                )
-                            else:
-                                repairable_repos.append(repo)
-                        with st.expander(f"Log walidacji: {repo}"):
-                            for command in validation.get("commands", []):
-                                st.code(command, language="powershell")
-                            if validation.get("output"):
-                                st.code(validation["output"], language=None)
-                            elif validation.get("error"):
-                                st.code(validation["error"], language=None)
-
-                    if repairable_repos and st.button(
-                        "🛠 Popraw pliki według logów i zweryfikuj ponownie",
-                        type="primary",
-                        use_container_width=True,
-                    ):
-                        repaired_count = 0
-                        updated_results = dict(validation_results)
-                        with st.spinner("Naprawiam błędy wskazane przez lokalną walidację…"):
-                            for repo in repairable_repos:
-                                repo_changes = changed_by_repo[repo]
-                                failure = validation_results[repo]
-                                failure_context = "\n".join(filter(None, [
-                                    failure.get("error", ""), failure.get("output", ""),
-                                ]))
-                                for mc in repo_changes:
-                                    current = mc.get("new_content") or ""
-                                    try:
-                                        repaired = repair_file_change(
-                                            question,
-                                            accepted_proposals,
-                                            repo,
-                                            mc["file_path"],
-                                            current,
-                                            failure_context,
-                                            repo_changes,
-                                        )
-                                    except Exception as exc:
-                                        mc["error"] = str(exc)
-                                        continue
-                                    if repaired.strip() and repaired != current:
-                                        mc["new_content"] = repaired
-                                        mc["diff"] = compute_diff(
-                                            mc["original"], repaired, mc["file_path"]
-                                        )
-                                        mc["error"] = None
-                                        repaired_count += 1
-                                updated_results[repo] = validate_file_changes(
-                                    repo_changes,
-                                    repo_changes[0]["repo_path"],
-                                )
-                        st.session_state.sandbox_validation_results = updated_results
-                        if repaired_count:
-                            st.session_state.sandbox_verify = None
-                            st.toast(f"Poprawiono {repaired_count} plik(ów) i ponowiono walidację.")
-                        else:
-                            st.warning("Agent nie wskazał zmian w plikach na podstawie logu.")
-                        st.rerun()
-
-                    validation_ready = validation_passed_for_repos(
-                        validation_results, changed_by_repo
-                    )
-
-                    # Status PR per-repo (już wystawionych).
-                    done_prs = [mc for mc in multi if mc.get("pr_result") is not None]
-                    for mc in done_prs:
-                        pr = mc["pr_result"]
-                        if pr.get("success"):
-                            st.success(f"✅ PR otwarty — `{mc['repo']}`: {pr.get('pr_url', '')}")
-                        elif pr.get("warning"):
-                            st.warning(f"⚠️ `{mc['repo']}`: {pr['warning']}")
-                        else:
-                            st.error(f"❌ `{mc['repo']}`: {pr.get('error', 'nieznany błąd')}")
-
-                    # Przycisk wystawiania PRów — testy lokalne NIE blokują (walidacja w CI).
-                    pending = [
-                        mc for mc in multi
-                        if mc.get("pr_result") is None and (mc.get("diff") or "").strip()
+            with st.expander("🔍 Weryfikacja kompletności (agent-recenzent)",
+                             expanded=bool(empty)):
+                st.caption(
+                    "Agent sprawdza, czy wygenerowany zestaw plików wystarcza, by zmiana "
+                    "działała end-to-end (czy nie brakuje plików, do których odwołuje się kod)."
+                )
+                if st.button("Sprawdź kompletność zmiany", use_container_width=True):
+                    gen_files = [
+                        {
+                            "repo": mc["repo"], "path": mc["file_path"],
+                            "action": mc.get("action", "modify"),
+                            "status": "ok" if (mc.get("new_content") or "").strip() else "empty",
+                            "head": "\n".join((mc.get("new_content") or "").splitlines()[:15]),
+                        }
+                        for mc in multi
                     ]
-                    if pending and has_any_diff:
-                        # Grupuj zmiany po repo — JEDEN PR per repo zbiera wszystkie jego pliki.
-                        pending_by_repo: dict = {}
-                        for mc in pending:
-                            pending_by_repo.setdefault(mc["repo"], []).append(mc)
-                        n_repos_p = len(pending_by_repo)
-                        default_title = (
-                            accepted_proposals[0].get("commit_hint") if accepted_proposals
-                            else f"change: {n_repos_p} serwisów"
+                    with st.spinner("Agent weryfikuje kompletność zestawu plików…"):
+                        st.session_state.sandbox_verify = verify_completeness(
+                            question, accepted_proposals,
+                            build_repo_map(st.session_state.get("chunks", [])),
+                            gen_files,
                         )
-                        pr_title = st.text_input("Tytuł PR / commit", value=default_title or "change")
-                        if not validation_ready:
-                            st.warning(
-                                "PR jest zablokowany do czasu zielonej lokalnej walidacji "
-                                "każdego zmienionego repo."
+                    st.rerun()
+
+                verdict = st.session_state.get("sandbox_verify")
+                if verdict:
+                    if verdict["complete"]:
+                        st.success("✅ Agent: zestaw plików wygląda na kompletny.")
+                    else:
+                        st.warning(f"⚠️ Agent: zestaw niekompletny. {verdict.get('notes', '')}")
+                    if verdict.get("missing"):
+                        st.markdown("**Brakujące / do uzupełnienia pliki:**")
+                        for m in verdict["missing"]:
+                            tag = "🆕 utwórz" if m["action"] == "create" else "✏️ zmień"
+                            st.markdown(
+                                f"- {tag} `{m['repo']}/{m['path']}`"
+                                + (f" — {m['reason']}" if m.get("reason") else "")
                             )
-                        st.caption(
-                            "Po lokalnej walidacji CI (`preprod-gate`) pozostaje drugą, pełną bramką."
-                        )
-                        if st.button(
-                            f"🚀 Wystaw {'PR' if n_repos_p == 1 else f'{n_repos_p} PRy/PRów'} "
-                            f"({n_repos_p} {'repozytorium' if n_repos_p == 1 else 'repozytoria/repozytoriów'})",
-                            type="primary", use_container_width=True,
-                            disabled=not validation_ready,
-                        ):
-                            with st.spinner(f"Wystawiam {n_repos_p} PR-ów (po jednym na repo)…"):
-                                for repo, mcs in pending_by_repo.items():
-                                    files = [
-                                        {"path": mc["file_path"], "content": mc["new_content"],
-                                         "allow_create": mc.get("action") == "create"}
-                                        for mc in mcs
-                                    ]
-                                    rs = open_pr_for_files(
-                                        files,
-                                        pr_title.strip() or f"change: {repo}",
-                                        "PR wygenerowany przez shop-qa-ui. Walidacja: bramka preprod-gate.",
-                                        f"ai-bot-playground/{repo}",
-                                        local_repo=mcs[0]["repo_path"],
-                                    )
-                                    for mc in mcs:  # ten sam wynik PR dla wszystkich plików repo
-                                        mc["pr_result"] = rs
-                            all_attempted = all(
-                                mc.get("pr_result") is not None
-                                for mc in multi if (mc.get("diff") or "").strip()
-                            )
-                            if all_attempted:
-                                st.session_state.sandbox_commit_done = "multi"
-                                # Jeden wpis per repo (nie per plik).
-                                by_repo_pr: dict = {}
-                                for mc in multi:
-                                    if not (mc.get("diff") or "").strip():
-                                        continue
-                                    pr = mc.get("pr_result") or {}
-                                    by_repo_pr[mc["repo"]] = {
-                                        "repo": mc["repo"],
-                                        "repo_slug": f"ai-bot-playground/{mc['repo']}",
-                                        "pr_url": pr.get("pr_url", ""),
-                                        "branch": pr.get("branch", ""),
-                                        "success": pr.get("success", False),
-                                        "error": pr.get("error", ""),
-                                        "warning": pr.get("warning", ""),
-                                    }
-                                st.session_state.qa_multi_prs = list(by_repo_pr.values())
-                                _advance()
+                        if st.button("➕ Dodaj brakujące do planu i wygeneruj",
+                                     type="primary", use_container_width=True):
+                            repo_paths = st.session_state.get("repo_paths", {})
+                            existing = {(mc["repo"], mc["file_path"]) for mc in multi}
+                            added = 0
+                            for m in verdict["missing"]:
+                                if (m["repo"] not in repo_paths
+                                        or (m["repo"], m["path"]) in existing
+                                        or m["path"].endswith(".py")):
+                                    continue
+                                rpath = repo_paths[m["repo"]]
+                                action, orig = m["action"], ""
+                                if action == "modify":
+                                    try:
+                                        with open(os.path.join(rpath, m["path"]), encoding="utf-8") as _f:
+                                            orig = _f.read()
+                                    except OSError:
+                                        action = "create"
+                                multi.append({
+                                    "repo": m["repo"], "file_path": m["path"], "action": action,
+                                    "original": orig, "repo_path": rpath, "reason": m.get("reason", ""),
+                                    "new_content": None, "diff": None, "error": None, "pr_result": None,
+                                })
+                                added += 1
+                            st.session_state.sandbox_verify = None
+                            st.session_state.sandbox_test_results = {}
+                            st.session_state.sandbox_validation_results = {}
+                            if added:
+                                st.toast(f"Dodano {added} plik(ów) do planu — generuję…")
                             st.rerun()
-                    elif not pending and done_prs:
-                        if st.button("Przejdź dalej → PR", type="primary"):
-                            _advance()
-                    st.stop()
+
+            # ── Lokalna bramka przed PR: worktree → build → log → naprawa → build ──
+            changed_by_repo: dict[str, list[dict]] = {}
+            for mc in multi:
+                if (mc.get("diff") or "").strip() and (mc.get("new_content") or "").strip():
+                    changed_by_repo.setdefault(mc["repo"], []).append(mc)
+
+            st.markdown("---")
+            st.markdown("### Walidacja lokalna przed PR")
+            st.caption(
+                "Zmiany są nakładane w odłączonym worktree. Gradle kompiluje kod i testy "
+                "w trybie offline; nie uruchamiamy Testcontainers, usług, PR-ów ani preprod."
+            )
+            if st.button(
+                "▶ Uruchom walidację wszystkich zmienionych repo",
+                use_container_width=True,
+                disabled=not changed_by_repo,
+            ):
+                validation_results: dict = {}
+                with st.spinner(f"Waliduję {len(changed_by_repo)} repozytorium/repozytoria…"):
+                    for repo, repo_changes in changed_by_repo.items():
+                        validation_results[repo] = validate_file_changes(
+                            repo_changes,
+                            repo_changes[0]["repo_path"],
+                        )
+                st.session_state.sandbox_validation_results = validation_results
+                st.rerun()
+
+            validation_results = st.session_state.get("sandbox_validation_results") or {}
+            failed_repos: list[str] = []
+            repairable_repos: list[str] = []
+            for repo, repo_changes in changed_by_repo.items():
+                validation = validation_results.get(repo)
+                if not validation:
+                    st.info(f"⏳ `{repo}` — oczekuje na walidację.")
+                    continue
+                if validation.get("success"):
+                    check_kind = "build projektu" if validation.get("project_check") else "kontrola statyczna"
+                    st.success(f"✅ `{repo}` — {check_kind} zakończony pomyślnie.")
+                else:
+                    failed_repos.append(repo)
+                    st.error(f"❌ `{repo}` — {validation.get('error', 'walidacja nieudana')}")
+                    if validation.get("failure_kind") == "environment":
+                        st.info(
+                            "To problem środowiska lub brak zależności offline, nie błąd "
+                            "wygenerowanego kodu. Uzupełnij lokalne zależności i ponów walidację."
+                        )
+                    else:
+                        repairable_repos.append(repo)
+                with st.expander(f"Log walidacji: {repo}"):
+                    for command in validation.get("commands", []):
+                        st.code(command, language="powershell")
+                    if validation.get("output"):
+                        st.code(validation["output"], language=None)
+                    elif validation.get("error"):
+                        st.code(validation["error"], language=None)
+
+            if repairable_repos and st.button(
+                "🛠 Popraw pliki według logów i zweryfikuj ponownie",
+                type="primary",
+                use_container_width=True,
+            ):
+                repaired_count = 0
+                updated_results = dict(validation_results)
+                with st.spinner("Naprawiam błędy wskazane przez lokalną walidację…"):
+                    for repo in repairable_repos:
+                        repo_changes = changed_by_repo[repo]
+                        failure = validation_results[repo]
+                        failure_context = "\n".join(filter(None, [
+                            failure.get("error", ""), failure.get("output", ""),
+                        ]))
+                        for mc in repo_changes:
+                            current = mc.get("new_content") or ""
+                            try:
+                                repaired = repair_file_change(
+                                    question,
+                                    accepted_proposals,
+                                    repo,
+                                    mc["file_path"],
+                                    current,
+                                    failure_context,
+                                    repo_changes,
+                                )
+                            except Exception as exc:
+                                mc["error"] = str(exc)
+                                continue
+                            if repaired.strip() and repaired != current:
+                                mc["new_content"] = repaired
+                                mc["diff"] = compute_diff(
+                                    mc["original"], repaired, mc["file_path"]
+                                )
+                                mc["error"] = None
+                                repaired_count += 1
+                        updated_results[repo] = validate_file_changes(
+                            repo_changes,
+                            repo_changes[0]["repo_path"],
+                        )
+                st.session_state.sandbox_validation_results = updated_results
+                if repaired_count:
+                    st.session_state.sandbox_verify = None
+                    st.toast(f"Poprawiono {repaired_count} plik(ów) i ponowiono walidację.")
+                else:
+                    st.warning("Agent nie wskazał zmian w plikach na podstawie logu.")
+                st.rerun()
+
+            validation_ready = validation_passed_for_repos(
+                validation_results, changed_by_repo
+            )
+
+            # Status PR per-repo (już wystawionych).
+            done_prs = [mc for mc in multi if mc.get("pr_result") is not None]
+            for mc in done_prs:
+                pr = mc["pr_result"]
+                if pr.get("success"):
+                    st.success(f"✅ PR otwarty — `{mc['repo']}`: {pr.get('pr_url', '')}")
+                elif pr.get("warning"):
+                    st.warning(f"⚠️ `{mc['repo']}`: {pr['warning']}")
+                else:
+                    st.error(f"❌ `{mc['repo']}`: {pr.get('error', 'nieznany błąd')}")
+
+            # Przycisk wystawiania PRów — testy lokalne NIE blokują (walidacja w CI).
+            pending = [
+                mc for mc in multi
+                if mc.get("pr_result") is None and (mc.get("diff") or "").strip()
+            ]
+            if pending and has_any_diff:
+                # Grupuj zmiany po repo — JEDEN PR per repo zbiera wszystkie jego pliki.
+                pending_by_repo: dict = {}
+                for mc in pending:
+                    pending_by_repo.setdefault(mc["repo"], []).append(mc)
+                n_repos_p = len(pending_by_repo)
+                default_title = (
+                    accepted_proposals[0].get("commit_hint") if accepted_proposals
+                    else f"change: {n_repos_p} serwisów"
+                )
+                pr_title = st.text_input("Tytuł PR / commit", value=default_title or "change")
+                if not validation_ready:
+                    st.warning(
+                        "PR jest zablokowany do czasu zielonej lokalnej walidacji "
+                        "każdego zmienionego repo."
+                    )
+                st.caption(
+                    "Po lokalnej walidacji CI (`preprod-gate`) pozostaje drugą, pełną bramką."
+                )
+                if st.button(
+                    f"🚀 Wystaw {'PR' if n_repos_p == 1 else f'{n_repos_p} PRy/PRów'} "
+                    f"({n_repos_p} {'repozytorium' if n_repos_p == 1 else 'repozytoria/repozytoriów'})",
+                    type="primary", use_container_width=True,
+                    disabled=not validation_ready,
+                ):
+                    with st.spinner(f"Wystawiam {n_repos_p} PR-ów (po jednym na repo)…"):
+                        for repo, mcs in pending_by_repo.items():
+                            files = [
+                                {"path": mc["file_path"], "content": mc["new_content"],
+                                 "allow_create": mc.get("action") == "create"}
+                                for mc in mcs
+                            ]
+                            rs = open_pr_for_files(
+                                files,
+                                pr_title.strip() or f"change: {repo}",
+                                "PR wygenerowany przez shop-qa-ui. Walidacja: bramka preprod-gate.",
+                                f"ai-bot-playground/{repo}",
+                                local_repo=mcs[0]["repo_path"],
+                            )
+                            for mc in mcs:  # ten sam wynik PR dla wszystkich plików repo
+                                mc["pr_result"] = rs
+                    all_attempted = all(
+                        mc.get("pr_result") is not None
+                        for mc in multi if (mc.get("diff") or "").strip()
+                    )
+                    if all_attempted:
+                        st.session_state.sandbox_commit_done = "multi"
+                        # Jeden wpis per repo (nie per plik).
+                        by_repo_pr: dict = {}
+                        for mc in multi:
+                            if not (mc.get("diff") or "").strip():
+                                continue
+                            pr = mc.get("pr_result") or {}
+                            by_repo_pr[mc["repo"]] = {
+                                "repo": mc["repo"],
+                                "repo_slug": f"ai-bot-playground/{mc['repo']}",
+                                "pr_url": pr.get("pr_url", ""),
+                                "branch": pr.get("branch", ""),
+                                "success": pr.get("success", False),
+                                "error": pr.get("error", ""),
+                                "warning": pr.get("warning", ""),
+                            }
+                        st.session_state.qa_multi_prs = list(by_repo_pr.values())
+                        _advance()
+                    st.rerun()
+            elif not pending and done_prs:
+                if st.button("Przejdź dalej → PR", type="primary"):
+                    _advance()
+            else:
+                # Model nie zwrócił ANI JEDNEJ zmiany (wszystko puste/identyczne).
+                # Bez tej gałęzi ekran kończył się bez żadnego przycisku i nie
+                # było jak wyjść z kroku 3 inaczej niż przez „Nowy wątek".
+                st.warning(
+                    "Żaden z zaplanowanych plików nie zawiera zmiany — model uznał, "
+                    "że nie ma czego modyfikować, albo zwrócił pustą treść."
+                )
+                col_retry, col_back = st.columns(2)
+                if col_retry.button("♻️ Zaplanuj i wygeneruj ponownie",
+                                    use_container_width=True):
+                    st.session_state.sandbox_plan = None
+                    st.session_state.sandbox_multi_changes = None
+                    st.rerun()
+                if col_back.button("← Wróć do Analyze", use_container_width=True):
+                    st.session_state.active_tab = "analyze"
+                    st.rerun()
+            st.stop()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # KROK 4 — PR
@@ -1121,39 +1148,99 @@ elif active_tab == "sandbox":
 elif active_tab == "pr":
     st.title("Pull Request")
 
-    # ── Ścieżka multi-repo (wiele PRów cross-repo) — podsumowanie + status buildów ──
-    if st.session_state.get("qa_multi_prs"):
+    if not st.session_state.get("qa_multi_prs"):
+        st.info("Brak wystawionych PR-ów — wróć do Piaskownicy i wystaw zmianę.")
+    else:
         multi_prs = st.session_state.qa_multi_prs
         opened = [pr for pr in multi_prs if pr["success"]]
         n_repos = len({pr["repo"] for pr in multi_prs})
         st.markdown(f"### Podsumowanie PR — {len(multi_prs)} w {n_repos} repozytoriach")
+
+        merged: dict = st.session_state.setdefault("qa_merged", {})
+        gate_states: dict = st.session_state.setdefault("qa_gate_states", {})
+
+        # Auto-odświeżanie TYLKO dopóki któryś PR czeka na bramkę. Gdy wszystkie
+        # doszły do stanu terminalnego (zielony/czerwony/zmergowany), polling się
+        # wyłącza: nie wołamy `gh` bez potrzeby i nie przerywamy klikania merge.
+        awaiting = [
+            pr for pr in multi_prs
+            if pr["success"] and not merged.get(pr["repo_slug"])
+            and gate_states.get(pr["repo_slug"], "unknown") not in ("success", "failure")
+        ]
         st.caption(
             f"{len(opened)}/{len(multi_prs)} otwartych pomyślnie. "
-            "Status buildu (`preprod-gate`) odświeża się automatycznie co 15 s."
+            + ("Status bramki (`preprod-gate`) odświeża się co 15 s."
+               if awaiting else "Wszystkie PR-y w stanie końcowym — auto-odświeżanie wyłączone.")
         )
 
-        @st.fragment(run_every=15)
+        def _merge_section(pr: dict) -> None:
+            """Podgląd na preprod + merge za potwierdzeniem człowieka (ostatni krok pętli).
+
+            Klucze widgetów są per repo, bo w jednym przebiegu może być kilka PR-ów,
+            a panel odświeża się automatycznie — bez stabilnych kluczy checkbox
+            gubiłby stan przy każdym odświeżeniu.
+            """
+            slug = pr["repo_slug"]
+            preview_svc, preview_port = (
+                ("shop-ui", "3001:80") if pr["repo"] == "shop-ui" else ("shop-gateway", "8080:8080")
+            )
+            st.markdown("**Sprawdź na preprod, czy zmiana działa jak chciałeś:**")
+            st.code(
+                f"kubectl --context kind-preprod -n shop port-forward svc/{preview_svc} {preview_port}",
+                language="bash",
+            )
+            st.caption(
+                "Potem: http://localhost:3001 (UI) lub http://localhost:8080/api/products (API)."
+            )
+            st.divider()
+            st.markdown("**Merge (human-in-the-loop)**")
+            confirmed = st.checkbox(
+                "Potwierdzam, że zmiana działa na preprod jak chciałem",
+                key=f"merge_confirm_{slug}",
+            )
+            if st.button("🔀 Merge PR (squash) do `main`", key=f"merge_btn_{slug}",
+                         type="primary", disabled=not confirmed):
+                with st.spinner(f"Merguję `{slug}`…"):
+                    result = merge_pr(slug, pr["branch"])
+                if result.get("success"):
+                    merged[slug] = True
+                    st.success("✅ Zmergowano do `main`.")
+                    st.balloons()
+                    # scope="app" — pełny rerun, by przeliczyć `awaiting` i zgasić polling.
+                    st.rerun(scope="app")
+                else:
+                    st.error(f"Merge nieudany: {result.get('error')}")
+
+        @st.fragment(run_every=15 if awaiting else None)
         def _pr_status_panel():
-            agg = {"success": 0, "pending": 0, "failure": 0, "unknown": 0, "nieotwarte": 0}
+            agg = {"success": 0, "pending": 0, "failure": 0, "unknown": 0,
+                   "nieotwarte": 0, "merged": 0}
             rows = []
             for pr in multi_prs:
+                slug = pr["repo_slug"]
                 if not pr["success"]:
                     agg["nieotwarte"] += 1
                     rows.append((pr, "nieotwarte", None))
                     continue
-                data = pr_checks(pr["repo_slug"], pr["branch"]) if pr.get("branch") else None
+                if merged.get(slug):
+                    agg["merged"] += 1
+                    rows.append((pr, "merged", None))
+                    continue
+                data = pr_checks(slug, pr["branch"]) if pr.get("branch") else None
                 state = _pr_build_state(data)
+                gate_states[slug] = state
                 agg[state] = agg.get(state, 0) + 1
                 rows.append((pr, state, data))
 
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("✅ Success", agg["success"])
             c2.metric("⏳ Pending", agg["pending"] + agg["unknown"])
             c3.metric("❌ Failed", agg["failure"])
             c4.metric("⚠️ Nieotwarte", agg["nieotwarte"])
+            c5.metric("🔀 Zmergowane", agg["merged"])
 
             icons = {"success": "✅", "pending": "⏳", "failure": "❌",
-                     "unknown": "⏳", "nieotwarte": "⚠️"}
+                     "unknown": "⏳", "nieotwarte": "⚠️", "merged": "🔀"}
             for pr, state, data in rows:
                 with st.expander(f"{icons[state]} `{pr['repo_slug']}` — {state}",
                                  expanded=state in ("failure", "nieotwarte")):
@@ -1166,9 +1253,14 @@ elif active_tab == "pr":
                         continue
                     if pr["pr_url"]:
                         st.link_button("Otwórz PR na GitHub", pr["pr_url"], use_container_width=True)
+                    if state == "merged":
+                        st.success("🔀 Zmergowano do `main` — pętla domknięta.")
+                        st.caption(f"Gałąź `{pr['branch']}` została usunięta przy merge.")
+                        continue
                     st.caption(f"Gałąź: `{pr['branch']}` · check **preprod-gate**")
                     if state == "success":
-                        st.success("Build zielony — PR gotowy do przeglądu/merge.")
+                        st.success("Bramka zielona — kandydat wdrożony na preprod.")
+                        _merge_section(pr)
                     elif state == "pending":
                         st.info("Build w toku — bramka `preprod-gate` jeszcze się wykonuje.")
                     elif state == "failure":
@@ -1199,59 +1291,4 @@ elif active_tab == "pr":
         _pr_status_panel()
         if st.button("🔄 Odśwież teraz", use_container_width=True):
             st.rerun()
-        st.stop()
-
-    # ── Ścieżka Java (serwis sklepu): PR + status bramki preprod + merge ──
-    if st.session_state.get("qa_repo_slug"):
-        slug = st.session_state.qa_repo_slug
-        branch = st.session_state.get("qa_pr_branch", "")
-        pr_url = st.session_state.get("qa_pr_url", "")
-        warn = st.session_state.get("qa_pr_warning", "")
-
-        st.markdown(f"### PR do `{slug}`")
-        if pr_url:
-            st.success(f"✅ PR otwarty: {pr_url}")
-            st.link_button("Otwórz PR na GitHub", pr_url, use_container_width=True)
-        elif warn:
-            st.warning(warn)
-        st.caption(f"Gałąź: `{branch}` · base `main` → wymagany check **preprod-gate / gate**")
-
-        if st.button("🔄 Sprawdź status bramki", use_container_width=True):
-            with st.spinner("Pobieram status checków…"):
-                st.session_state.qa_checks = pr_checks(slug, branch)
-            st.rerun()
-
-        data = st.session_state.get("qa_checks")
-        gate_ok = False
-        if data:
-            if not data.get("available"):
-                st.info(f"Brak statusu checków: {data.get('message', '')}")
-            else:
-                checks = data.get("checks", [])
-                if not checks:
-                    st.caption("Brak checków — bramka jeszcze nie wystartowała.")
-                for c in checks:
-                    bucket = (c.get("bucket") or c.get("state") or "").lower()
-                    icon = "✅" if bucket in ("pass", "success") else ("❌" if bucket in ("fail", "failure") else "⏳")
-                    st.markdown(f"{icon} **{c.get('name', '?')}** — {bucket}")
-                    if "preprod-gate" in c.get("name", "") and bucket in ("pass", "success"):
-                        gate_ok = True
-
-        if gate_ok:
-            st.success("Bramka zielona — kandydat wdrożony na preprod.")
-            st.markdown("**Podgląd na preprod (sprawdź czy działa jak chcesz):**")
-            st.code("kubectl --context kind-preprod -n shop port-forward svc/shop-gateway 8080:8080", language="bash")
-            st.caption("Następnie np. http://localhost:8080/api/products")
-            st.divider()
-            st.markdown("### Merge (human-in-the-loop)")
-            if st.checkbox("Potwierdzam, że zmiana działa na preprod jak chciałem"):
-                if st.button("🔀 Merge PR (squash) do main", type="primary"):
-                    with st.spinner("Merguję PR…"):
-                        mres = merge_pr(slug, branch)
-                    if mres.get("success"):
-                        st.success("✅ Zmergowano do `main`.")
-                        st.balloons()
-                    else:
-                        st.error(f"Merge nieudany: {mres.get('error')}")
-        st.stop()
 

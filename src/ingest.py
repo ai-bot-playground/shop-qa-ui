@@ -32,7 +32,10 @@ def parse_python_file(filepath: Path, repo_root: Path) -> list[CodeChunk]:
         return []
 
     lines = source_text.splitlines()
-    rel_path = str(filepath.relative_to(repo_root))
+    # as_posix(), nie str(): na Windows str() daje `src\main\java\...`, a planner LLM
+    # i `open_pr_for_files` operują na ścieżkach POSIX-owych. Mieszanie konwencji
+    # rozjeżdżało klucze (repo, path) i cytowania w UI.
+    rel_path = filepath.relative_to(repo_root).as_posix()
     chunks = []
 
     for node in ast.walk(tree):
@@ -122,7 +125,10 @@ def parse_java_file(filepath: Path, repo_root: Path) -> list[CodeChunk]:
         return []
 
     lines = text.splitlines()
-    rel_path = str(filepath.relative_to(repo_root))
+    # as_posix(), nie str(): na Windows str() daje `src\main\java\...`, a planner LLM
+    # i `open_pr_for_files` operują na ścieżkach POSIX-owych. Mieszanie konwencji
+    # rozjeżdżało klucze (repo, path) i cytowania w UI.
+    rel_path = filepath.relative_to(repo_root).as_posix()
     depths = _line_start_depths(lines)
     chunks: list[CodeChunk] = []
 
@@ -196,7 +202,10 @@ def parse_js_file(filepath: Path, repo_root: Path) -> list[CodeChunk]:
         return []
 
     lines = text.splitlines()
-    rel_path = str(filepath.relative_to(repo_root))
+    # as_posix(), nie str(): na Windows str() daje `src\main\java\...`, a planner LLM
+    # i `open_pr_for_files` operują na ścieżkach POSIX-owych. Mieszanie konwencji
+    # rozjeżdżało klucze (repo, path) i cytowania w UI.
+    rel_path = filepath.relative_to(repo_root).as_posix()
 
     # Top-level declarations only (no leading whitespace).
     decls: list[tuple[int, str]] = []
@@ -254,7 +263,10 @@ def parse_config_file(filepath: Path, repo_root: Path) -> list[CodeChunk]:
     if not text.strip():
         return []
     lines = text.splitlines()
-    rel_path = str(filepath.relative_to(repo_root))
+    # as_posix(), nie str(): na Windows str() daje `src\main\java\...`, a planner LLM
+    # i `open_pr_for_files` operują na ścieżkach POSIX-owych. Mieszanie konwencji
+    # rozjeżdżało klucze (repo, path) i cytowania w UI.
+    rel_path = filepath.relative_to(repo_root).as_posix()
     src = text if len(lines) <= _MAX_CONFIG_LINES else "\n".join(lines[:_MAX_CONFIG_LINES])
     return [CodeChunk(
         file_path=rel_path, symbol=filepath.name,

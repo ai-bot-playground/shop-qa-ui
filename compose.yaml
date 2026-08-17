@@ -7,9 +7,12 @@
 #
 # UI: http://localhost:8501
 #
-# Tryb dev bind-montuje całe repo (z .git), więc:
-#   - Streamlit przeładowuje się na żywo gdy instancje T1–T5 dopisują kod,
-#   - sandbox (worktree → PR) działa na realnym repo z historią git.
+# Tryb dev bind-montuje całe repo (z .git), więc Streamlit przeładowuje się na
+# żywo po edycji kodu.
+#
+# UWAGA: ten wariant obsługuje indeksowanie i analizę. Lokalna walidacja
+# (Gradle/npm) i wystawianie PR-ów wymagają JDK, Node, `gh` i klonów repo
+# shop-* — tego w obrazie nie ma. Do pełnego przepływu użyj run-local.ps1.
 
 services:
   app:
@@ -21,7 +24,7 @@ services:
     ports:
       - "8501:8501"
     env_file:
-      - .env.docker          # skopiuj z .env.docker.example i uzupełnij klucze Azure
+      - .env.docker          # skopiuj z .env.docker.example i uzupełnij OPENROUTER_API_KEY
     environment:
       # Wartości domyślne (env_file ma pierwszeństwo, jeśli ustawione).
       STREAMLIT_PORT: "8501"
@@ -29,10 +32,6 @@ services:
       # Dev: żywy kod + historia git (sandbox/commit). Do produkcji usuń ten mount
       # i polegaj na kodzie zapieczonym w obrazie.
       - ./:/app
-      # Cache indeksu — przeżywa restart kontenera (indeks budowany raz, reindex po Merge PR).
-      - index-cache:/app/.index_cache
-      # Opcjonalnie: zewnętrzne repo do analizy. Ustaw REPO_PATH=/workspace/<repo>.
-      # - ./workspace:/workspace
     # Health na poziomie compose — działa niezależnie od formatu obrazu (OCI ignoruje
     # HEALTHCHECK z Containerfile; compose-level działa zawsze).
     healthcheck:
@@ -42,6 +41,3 @@ services:
       retries: 3
       start_period: 25s
     restart: unless-stopped
-
-volumes:
-  index-cache:

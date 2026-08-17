@@ -8,12 +8,16 @@
 #   "cannot open '.git/FETCH_HEAD': Read-only file system". Na hoście repo są
 #   zapisywalne, `gh` jest zalogowany, a `git push` korzysta z GCM — działa.
 #
-# Użycie:
-#   pwsh -File run-local.ps1            # port 8502 (jak dotychczasowy kontener)
-#   pwsh -File run-local.ps1 -Port 8501
+# Użycie (na tej maszynie jest tylko Windows PowerShell 5.1 — `pwsh` NIE istnieje):
+#   powershell -File run-local.ps1            # port 8502 (jak dotychczasowy kontener)
+#   powershell -File run-local.ps1 -Port 8501
+#   powershell -File run-local.ps1 -Fake      # tryb offline: bez OpenRoutera i bez kosztów
 [CmdletBinding()]
 param(
-  [int]$Port = 8502
+  [int]$Port = 8502,
+  # Atrapa LLM (src/fake_llm.py): deterministyczne odpowiedzi, zero wywołań sieciowych.
+  # Do przeklikiwania i testowania mechaniki przepływu bez zużywania tokenów.
+  [switch]$Fake
 )
 $ErrorActionPreference = 'Stop'
 
@@ -38,6 +42,13 @@ if (-not (Test-Path $venvPy)) {
 $env:SHOP_REPOS_DIR = $reposRoot
 # Telemetria tokenów: natywnie serwis jest pod localhost:8088 (port-forward-ui.ps1).
 if (-not $env:TOKEN_METRICS_URL) { $env:TOKEN_METRICS_URL = 'http://localhost:8088' }
+
+if ($Fake) {
+  $env:QA_FAKE_LLM = '1'
+  Write-Host "[run-local] TRYB OFFLINE (QA_FAKE_LLM=1) - odpowiedzi z atrapy, bez OpenRoutera"
+} else {
+  Remove-Item Env:\QA_FAKE_LLM -ErrorAction SilentlyContinue
+}
 
 Write-Host "[run-local] SHOP_REPOS_DIR = $env:SHOP_REPOS_DIR"
 Write-Host "[run-local] UI -> http://localhost:$Port"

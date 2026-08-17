@@ -1,5 +1,6 @@
 import os
 import subprocess
+from pathlib import Path
 
 
 def _clone_base() -> str:
@@ -12,63 +13,6 @@ def _clone_base() -> str:
     base = os.environ.get("SHOPQA_TMP") or os.path.join(os.path.expanduser("~"), ".shopqa-tmp")
     os.makedirs(base, exist_ok=True)
     return base
-
-
-def open_pr_for_change(diff_text: str, title: str, body: str, repo_slug: str,
-                       base: str = "main", branch_prefix: str = "ai-change") -> dict:
-    """Sklonuj repo_slug, zaaplikuj diff na nowej gałęzi, wypchnij i otwórz PR do `base`."""
-    import shutil
-    import tempfile
-    from datetime import datetime
-
-    if not diff_text.strip():
-        return {"success": False, "error": "Pusty diff — nic do wystawienia."}
-
-    tmp = tempfile.mkdtemp(prefix="shopqa-", dir=_clone_base())
-    branch = f"{branch_prefix}/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    clone_dir = os.path.join(tmp, "repo")
-    patch = os.path.join(tmp, "change.patch")
-    try:
-        cl = subprocess.run(
-            ["gh", "repo", "clone", repo_slug, clone_dir, "--",
-             "--depth", "1", "--branch", base],
-            capture_output=True, text=True,
-        )
-        if cl.returncode != 0:
-            return {"success": False, "error": f"clone: {cl.stderr.strip()}"}
-
-        with open(patch, "w", encoding="utf-8", newline="\n") as f:
-            f.write(diff_text if diff_text.endswith("\n") else diff_text + "\n")
-
-        chk = subprocess.run(["git", "-C", clone_dir, "apply", "--check", patch],
-                             capture_output=True, text=True)
-        if chk.returncode != 0:
-            return {"success": False,
-                    "error": f"diff nie aplikuje się: {(chk.stderr or chk.stdout).strip()}"}
-
-        for cmd in (
-            ["git", "-C", clone_dir, "checkout", "-b", branch],
-            ["git", "-C", clone_dir, "apply", patch],
-            ["git", "-C", clone_dir, "add", "-A"],
-            ["git", "-C", clone_dir, "commit", "-m", title],
-            ["git", "-C", clone_dir, "push", "-u", "origin", branch],
-        ):
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                return {"success": False, "branch": branch,
-                        "error": f"{cmd[3]}: {(r.stderr or r.stdout).strip()}"}
-
-        pr = subprocess.run(
-            ["gh", "pr", "create", "--repo", repo_slug, "--base", base,
-             "--head", branch, "--title", title, "--body", body],
-            capture_output=True, text=True,
-        )
-        if pr.returncode != 0:
-            return {"success": True, "branch": branch, "pr_url": "",
-                    "warning": f"branch wypchnięty, PR nieautomatyczny: {pr.stderr.strip()}"}
-        return {"success": True, "branch": branch, "pr_url": pr.stdout.strip()}
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def pr_checks(repo_slug: str, branch: str) -> dict:
@@ -212,6 +156,13 @@ def _validation_failure_kind(command: list[str], output: str) -> str:
         "command not found",
         "cannot find module",
         "toolchain download repositories have not been configured",
+        # Gradle/JVM nie potrafi zestawić pary socketów na loopbacku (Selector.open()).
+        # Typowo oprogramowanie ochronne łączące się do świeżo otwartych portów
+        # localhost — nie ma to NIC wspólnego z wygenerowanym kodem, więc nie może
+        # trafić do LLM jako błąd do naprawy.
+        "unable to establish loopback connection",
+        "unable to start the daemon process",
+        "could not connect to the gradle daemon",
     )
     if any(marker in text for marker in environment_markers):
         return "environment"
@@ -361,12 +312,18 @@ def validation_passed_for_repos(results: dict, repos) -> bool:
 
 def _resolve_local_repo(local_repo: str | None, repo_slug: str) -> str | None:
     """Ścieżka do LOKALNEGO klonu serwisu. Najpierw jawnie podany `local_repo`,
-    potem SHOP_REPOS_DIR/<nazwa-repo> (domyślnie ../ai-bot-playground)."""
+    potem SHOP_REPOS_DIR/<nazwa-repo>.
+
+    Fallback liczony jest od położenia TEGO pliku (src/ → shop-qa-ui/ → workspace),
+    a nie od cwd: repozytoria `shop-*` leżą jako rodzeństwo shop-qa-ui, więc
+    dawne `../ai-bot-playground` nie trafiało w nic niezależnie od katalogu startu.
+    """
     candidates = []
     if local_repo:
         candidates.append(local_repo)
     name = repo_slug.split("/")[-1]
-    base_dir = os.environ.get("SHOP_REPOS_DIR", os.path.join("..", "ai-bot-playground"))
+    default_root = Path(__file__).resolve().parents[2]
+    base_dir = os.environ.get("SHOP_REPOS_DIR") or str(default_root)
     candidates.append(os.path.join(base_dir, name))
     for c in candidates:
         if c and os.path.isdir(os.path.join(c, ".git")):
@@ -453,13 +410,3 @@ def open_pr_for_files(file_changes: list[dict], title: str, body: str,
         shutil.rmtree(wt, ignore_errors=True)
 
 
-def open_pr_for_file_change(rel_path: str, new_content: str, title: str, body: str,
-                            repo_slug: str, base: str = "main",
-                            branch_prefix: str = "ai-change",
-                            local_repo: str | None = None,
-                            allow_create: bool = False) -> dict:
-    """Cienki wrapper na open_pr_for_files dla pojedynczego pliku (kompatybilność)."""
-    return open_pr_for_files(
-        [{"path": rel_path, "content": new_content, "allow_create": allow_create}],
-        title, body, repo_slug, base, branch_prefix, local_repo,
-    )

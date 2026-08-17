@@ -48,11 +48,3 @@ spec:
             limits:
               cpu: "1"
               memory: "1Gi"
-          volumeMounts:
-            - name: index-cache
-              mountPath: /app/.index_cache
-      volumes:
-        # Cache indeksu (indeks budowany raz, reindex po Merge PR). emptyDir = ulotny;
-        # do trwałości podmień na PVC.
-        - name: index-cache
-          emptyDir: {}

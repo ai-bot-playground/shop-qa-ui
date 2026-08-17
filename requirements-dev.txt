@@ -1,0 +1,8 @@
+# Zależności wyłącznie do testów — NIE trafiają do obrazu (Containerfile
+# instaluje tylko requirements.txt, żeby runtime został chudy).
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   python -m pytest
+-r requirements.txt
+
+pytest>=8.0.0

@@ -5,6 +5,7 @@ import re
 import requests
 from dotenv import load_dotenv
 
+from . import fake_llm
 from .ingest import ingest_repo, ingest_app, CodeChunk
 from .retriever import keyword_search
 
@@ -119,7 +120,20 @@ def _openrouter_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY", "")
 
 
+def _fake_llm_enabled() -> bool:
+    """QA_FAKE_LLM=1 → tryb offline: zero wywołań sieciowych, zero kosztów.
+
+    Czytane przy każdym wywołaniu (nie raz przy importcie), żeby dało się
+    przełączyć tryb bez restartu procesu Streamlita.
+    """
+    return os.environ.get("QA_FAKE_LLM", "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def _call(system: str, user_content: str, max_tokens: int = 1024, light: bool = False) -> str:
+    if _fake_llm_enabled():
+        # `_FAKE_KINDS` mapuje prompt systemowy → rodzaj odpowiedzi atrapy;
+        # definicja stoi pod ostatnim promptem (`_EXPAND_SYSTEM`).
+        return fake_llm.respond(_FAKE_KINDS.get(system, ""), user_content)
     return _call_openrouter(system, user_content, max_tokens, light=light)
 
 
@@ -277,37 +291,6 @@ Zasady:
 """
 
 
-_FIX_SYSTEM = """\
-Jesteś senior developerem. Wygeneruj poprawioną wersję funkcji Python.
-
-Zasady:
-1. Zwróć WYŁĄCZNIE kod funkcji — bez wyjaśnień, bez markdown, bez ogrodzeń ```.
-2. Zachowaj tę samą sygnaturę funkcji.
-3. Zastosuj opisaną zmianę.
-4. Kod musi być gotowy do wklejenia bezpośrednio do pliku Python.\
-"""
-
-_FIX_TESTS_SYSTEM = """\
-Jesteś senior developerem. Popraw funkcję Python tak by przechodziła wszystkie podane testy.
-
-Zasady:
-1. Zwróć WYŁĄCZNIE kod funkcji — bez wyjaśnień, bez markdown, bez ogrodzeń ```.
-2. Zachowaj tę samą sygnaturę funkcji.
-3. Logika musi zwracać dokładnie oczekiwane wartości testów.\
-"""
-
-_DIFF_SYSTEM = """\
-Jesteś senior developerem pracującym nad systemem opisanym w KONTEKST SYSTEMU.
-Wygeneruj żądaną zmianę jako UNIFIED DIFF gotowy dla `git apply`.
-
-Zasady:
-1. Zwróć WYŁĄCZNIE diff — bez wyjaśnień, bez markdown, bez ogrodzeń ```.
-2. Ścieżki względem korzenia repozytorium serwisu: nagłówki "--- a/<path>" i "+++ b/<path>".
-3. Poprawne hunki "@@ ... @@" z ~3 liniami kontekstu, zgodne z dostarczonym KODEM.
-4. Zmiana minimalna i skupiona; zachowaj styl, konwencje i kompilowalność (Java/Spring).
-5. Jeśli zmiany nie da się bezpiecznie wykonać na podstawie dostarczonego kodu — zwróć pusty wynik.\
-"""
-
 _FILECHANGE_SYSTEM = """\
 Jesteś senior developerem systemu opisanego w KONTEKST SYSTEMU. Otrzymasz PEŁNĄ treść
 jednego pliku oraz opis żądanej zmiany.
@@ -441,63 +424,6 @@ def _strip_fences(text: str) -> str:
         if t.rstrip().endswith("```"):
             t = t.rstrip()[:-3]
     return t.strip("\n")
-
-
-def fix_code_with_tests(source_code: str, failing_tests: list[dict]) -> str:
-    """Regenerate source_code so it passes the given failing tests."""
-    failures_desc = "\n".join(
-        f"- {t['name']}: oczekiwano {t['expected']!r}, otrzymano {t['got']!r}"
-        + (f" [błąd: {t['error']}]" if t.get("error") else "")
-        for t in failing_tests
-        if not t["passed"]
-    )
-    user_msg = (
-        f"Funkcja:\n{source_code}\n\n"
-        f"Nieprzechodzące testy:\n{failures_desc}\n\n"
-        f"Poprawiona funkcja:"
-    )
-    try:
-        return _call(_FIX_TESTS_SYSTEM, user_msg, max_tokens=1024).strip()
-    except Exception:
-        return source_code
-
-
-def generate_code_fix(original_source: str, proposal: dict, question: str) -> str:
-    """Return modified function source code based on the accepted proposal."""
-    user_msg = (
-        f"Oryginalna funkcja:\n{original_source}\n\n"
-        f"Pytanie użytkownika: {question}\n\n"
-        f"Proponowana zmiana: {proposal['title']}\n"
-        f"Opis: {proposal['description']}\n\n"
-        f"Wygeneruj poprawioną funkcję:"
-    )
-    try:
-        return _call(_FIX_SYSTEM, user_msg, max_tokens=1024).strip()
-    except Exception as exc:
-        return f"# Błąd generowania kodu: {exc}\n{original_source}"
-
-
-def generate_change_diff(question: str, proposals: list[dict], chunks: list[CodeChunk]) -> str:
-    """Generate the requested change as a unified diff (git apply) for a service.
-
-    System-aware (uses _SHOP_FACTS) and grounded in the retrieved code chunks.
-    Returns an empty string when no diff can be produced (incl. demo mode).
-    """
-    code_ctx = _build_context(chunks)
-    props = "\n".join(
-        f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or [])
-    )
-    user_msg = (
-        f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
-        f"KOD (fragmenty z repo serwisu):\n{code_ctx}\n\n"
-        f"ŻĄDANA ZMIANA: {question}\n"
-        f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
-        f"Wygeneruj unified diff:"
-    )
-    try:
-        return _strip_fences(_call(_DIFF_SYSTEM, user_msg, max_tokens=2048))
-    except Exception:
-        return ""
 
 
 def generate_file_change(question: str, proposals: list[dict],
@@ -711,6 +637,20 @@ Zasady:
   "płatność"->payment, "powiadomienie"->notification, "anulowanie"->cancel).
 - Uwzględnij nazwy serwisów/tematów z KONTEKSTU SYSTEMU, jeśli pasują.\
 """
+
+
+# Mapa promptów systemowych → rodzaje odpowiedzi atrapy offline (QA_FAKE_LLM=1).
+# Musi stać PO definicjach wszystkich promptów; `_call` sięga po nią w czasie
+# wywołania, nie importu. Nieobecny prompt → atrapa zwraca BRAK_ZMIAN.
+_FAKE_KINDS = {
+    _EXPAND_SYSTEM: "expand",
+    _TECH_SYSTEM: "tech",
+    _BIZ_SYSTEM: "biz",
+    _PLAN_SYSTEM: "plan",
+    _VERIFY_SYSTEM: "verify",
+    _FILECHANGE_SYSTEM: "filechange",
+    _NEWFILE_SYSTEM: "newfile",
+}
 
 
 def expand_query(question: str) -> list[str]:
