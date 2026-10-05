@@ -114,6 +114,67 @@ class SandboxFlowTests(unittest.TestCase):
         )
 
 
+class RepairLoopTests(unittest.TestCase):
+    """Naprawa z logu musi sięgać też po pliki z planu, które wróciły puste."""
+
+    def test_repair_fills_a_planned_file_that_came_back_empty(self):
+        # Przebieg z prawdziwym modelem (05.10): PurchaseSteps.java wrócił pusty, dry-run
+        # Cucumbera zgłosił niezdefiniowane kroki, a naprawa obejmowała tylko pliki z diffem.
+        from src.ingest import ingest_app
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = _make_workspace(tmp)
+            repo_path = os.path.join(workspace, "shop-payment")
+            service = "src/main/java/com/shop/payment/PaymentService.java"
+            policy = "src/main/java/com/shop/payment/FeePolicy.java"
+            changed = JAVA_SOURCE.replace("void charge", "long fee() { return FeePolicy.FEE; }\n    void charge")
+            app = AppTest.from_file(APP, default_timeout=120)
+            app.session_state["active_tab"] = "sandbox"
+            app.session_state["chunks"] = ingest_app([{"name": "shop-payment", "path": repo_path}])
+            app.session_state["repo_paths"] = {"shop-payment": repo_path}
+            app.session_state["sandbox_question"] = "dodaj opłatę"
+            app.session_state["sandbox_accepted_proposals"] = []
+            app.session_state["sandbox_preload_chunks"] = app.session_state["chunks"]
+            app.session_state["sandbox_plan"] = [
+                {"repo": "shop-payment", "path": service, "action": "modify", "reason": "użyj opłaty"},
+                {"repo": "shop-payment", "path": policy, "action": "create", "reason": "polityka opłat"},
+            ]
+            app.session_state["sandbox_multi_changes"] = [
+                {"repo": "shop-payment", "file_path": service, "action": "modify", "reason": "użyj opłaty",
+                 "original": JAVA_SOURCE, "repo_path": repo_path, "new_content": changed,
+                 "diff": "--- a\n+++ b\n+fee", "error": None, "pr_result": None},
+                {"repo": "shop-payment", "file_path": policy, "action": "create", "reason": "polityka opłat",
+                 "original": "", "repo_path": repo_path, "new_content": "",
+                 "diff": "", "error": None, "pr_result": None},
+            ]
+            app.session_state["sandbox_validation_results"] = {"shop-payment": {
+                "success": False, "failure_kind": "code", "error": "Walidacja nie przeszła (exit 1).",
+                "output": "error: cannot find symbol FeePolicy", "commands": [],
+            }}
+            validated = []
+
+            def fake_validate(changes, local_repo, timeout=600):
+                validated.append(sorted(c["file_path"] for c in changes))
+                return {"success": True, "project_check": True, "commands": [], "output": "", "error": "",
+                        "failure_kind": ""}
+
+            def fake_repair(question, proposals, repo, file_path, current, log, related=None):
+                return "class FeePolicy { static final long FEE = 1; }" if file_path == policy else ""
+
+            with mock.patch.dict(os.environ, {"QA_FAKE_LLM": "1", "SHOP_REPOS_DIR": workspace}), \
+                    mock.patch("src.agent.repair_file_change", side_effect=fake_repair), \
+                    mock.patch("src.sandbox.validate_file_changes", side_effect=fake_validate):
+                app = app.run()
+                repair = next(b for b in app.button if "Popraw pliki" in b.label)
+                app = repair.click().run()
+
+        self.assertFalse(app.exception, app.exception)
+        filled = next(c for c in app.session_state["sandbox_multi_changes"] if c["file_path"] == policy)
+        self.assertIn("FeePolicy", filled["new_content"])
+        self.assertTrue(filled["diff"].strip())
+        self.assertEqual([[policy, service]], validated, "ponowna walidacja musi objąć dopisany plik")
+
+
 class PrStepTests(unittest.TestCase):
     """Krok 4 — status bramki i merge dla ścieżki multi-repo."""
 
@@ -181,6 +242,51 @@ class PrStepTests(unittest.TestCase):
         self.assertTrue(
             app.session_state["qa_merged"]["ai-bot-playground/shop-payment"]
         )
+
+    def test_cancelled_gate_is_a_failure_not_endless_pending(self):
+        # `gh pr checks` zgłasza anulowany check jako bucket "cancel" — dawniej
+        # wpadał do „pending" i panel odpytywał GitHuba w nieskończoność.
+        cancelled = {"available": True, "checks": [{"name": "preprod-gate / gate", "bucket": "cancel"}]}
+
+        with mock.patch("src.sandbox.pr_checks", return_value=cancelled), \
+                mock.patch("src.sandbox.pr_failure_summary", return_value=""):
+            app = self._app_with_prs().run()
+
+        self.assertFalse(app.exception)
+        self.assertEqual("failure", app.session_state["qa_gate_states"]["ai-bot-playground/shop-payment"])
+        self.assertFalse(any("Merge PR" in b.label for b in app.button))
+
+    def _app_with_ungated_pr(self, age_s: float, required: list | None) -> AppTest:
+        import time
+        no_checks = {"available": True, "checks": [], "message": "no checks reported"}
+        app = self._app_with_prs()
+        app.session_state["qa_multi_prs"][0]["opened_at"] = time.time() - age_s
+        with mock.patch("src.sandbox.pr_checks", return_value=no_checks), \
+                mock.patch("src.sandbox.required_checks", return_value=required):
+            return app.run()
+
+    def test_repo_without_any_gate_offers_merge_with_warning(self):
+        # Np. shop-acceptance-tests: `main` bez ochrony i bez workflow na PR —
+        # check nigdy się nie pojawi, więc czekanie w nieskończoność blokowało pętlę.
+        app = self._app_with_ungated_pr(age_s=120, required=[])
+
+        self.assertFalse(app.exception)
+        self.assertEqual("no_gate", app.session_state["qa_gate_states"]["ai-bot-playground/shop-payment"])
+        self.assertTrue(any("nie ma bramki" in w.value for w in app.warning))
+        self.assertTrue(any("Merge PR" in b.label for b in app.button))
+
+    def test_fresh_pr_without_checks_still_waits_for_the_gate(self):
+        app = self._app_with_ungated_pr(age_s=5, required=[])
+
+        self.assertEqual("pending", app.session_state["qa_gate_states"]["ai-bot-playground/shop-payment"])
+        self.assertFalse(any("Merge PR" in b.label for b in app.button))
+
+    def test_protected_repo_without_checks_never_skips_the_gate(self):
+        # Wymagany check, który nie wystartował (np. runner offline) — to NIE jest „brak bramki".
+        app = self._app_with_ungated_pr(age_s=600, required=["preprod-gate / gate"])
+
+        self.assertEqual("pending", app.session_state["qa_gate_states"]["ai-bot-playground/shop-payment"])
+        self.assertFalse(any("Merge PR" in b.label for b in app.button))
 
     def test_step_four_without_prs_explains_itself(self):
         app = AppTest.from_file(APP, default_timeout=60)
