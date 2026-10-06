@@ -121,6 +121,24 @@ class UserJourneyTests(unittest.TestCase):
             "atrapa nie wygenerowała treści dla żadnego pliku",
         )
 
+    def test_question_link_prefills_the_question(self):
+        # ?q=… — link z gotową prośbą (PO dostaje go np. w wiadomości); wysłanie i tak przyciskiem.
+        app = AppTest.from_file(APP, default_timeout=180)
+        app.query_params["q"] = "Pokaż stan magazynu przy produkcie"
+        app = app.run()
+        app = self._click(app, "Indeksuj aplikację")
+
+        self.assertEqual("analyze", app.session_state["active_tab"])
+        self.assertEqual("Pokaż stan magazynu przy produkcie", app.text_area[0].value)
+        self.assertNotIn("q", app.query_params, "pytanie z linku ma się wczytać raz, nie przy każdym rerunie")
+
+        # Wysłanie BEZ edycji pola: wcześniej prefill znikał po rerunie (nowy widżet) i
+        # „Zapytaj" dostawał pusty string — złapane dopiero w prawdziwej przeglądarce.
+        app = self._click(app, "Zapytaj")
+        messages = app.session_state["sessions"][0]["messages"]
+        self.assertEqual(1, len(messages), "pytanie z linku nie dotarło do analizy")
+        self.assertEqual("Pokaż stan magazynu przy produkcie", messages[0]["question"])
+
     def test_sandbox_counts_as_completed_once_changes_exist(self):
         """Stepper ma odzwierciedlać stan, a nie czekać na PR.
 
@@ -140,7 +158,7 @@ class UserJourneyTests(unittest.TestCase):
         # Stepper rysuje „✓" w kółku kroku ukończonego, a jego numer — gdy nie jest.
         stepper = next(m.value for m in app.markdown if "Workflow" in m.value)
         for label, expected in (("System Ready", "✓"), ("Analyze", "✓"),
-                                ("Piaskownica", "✓"), ("PR", "4")):
+                                ("Piaskownica", "✓"), ("Test PO", "4"), ("PR", "5")):
             self.assertEqual(
                 expected, self._circle_of(stepper, label),
                 f"krok „{label}” ma zły znacznik w stepperze",

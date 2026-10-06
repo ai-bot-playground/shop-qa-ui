@@ -164,6 +164,35 @@ class ScenarioHarness(unittest.TestCase):
         self.assertFalse(app.exception, app.exception)
         return app, self._state(app, "sandbox_validation_results") or {}
 
+    def _open_prs_after_po_test(self, app, fake_open_pr):
+        """Wdrożenie na (podmienione) środowisko testowe → PO klika „Działa" → PR-y.
+
+        Środowisko K8s jest tu atrapą — prawdziwe wdrożenie sprawdza przebieg E2E;
+        scenariusz sprawdza, Z CZYM aplikacja wdroży zmianę i wystawi PR-y.
+        """
+        deployed: dict = {}
+
+        def fake_deploy(changes, namespace=None):
+            deployed.update(changes)
+            return {"success": True, "namespace": "test-scenario", "skipped": [],
+                    "images": {r: f"localhost/{r}:test-scenario" for r in changes},
+                    "urls": {"ui": "http://localhost:31001", "api": "http://localhost:31002"},
+                    "pids": {}, "log": [], "error": ""}
+
+        with mock.patch("src.testenv.deploy_test_env", side_effect=fake_deploy), \
+                mock.patch("src.testenv.links_alive", return_value={"ui": True, "api": True}), \
+                mock.patch("src.testenv.destroy_test_env"), \
+                mock.patch("src.agent.propose_po_checks", return_value=[]), \
+                mock.patch("src.sandbox.open_pr_for_files", side_effect=fake_open_pr), \
+                mock.patch("src.sandbox.pr_checks", return_value={"available": True, "checks": []}), \
+                mock.patch("src.sandbox.required_checks", return_value=["preprod-gate / gate"]):
+            app = self._require_button(app, "Wdróż na środowisko testowe").click().run()
+            self.assertFalse(app.exception, app.exception)
+            self.assertEqual("test", app.session_state["active_tab"])
+            app = self._require_button(app, "Działa").click().run()
+        self.assertFalse(app.exception, app.exception)
+        return app, deployed
+
     def _assert_green(self, scenario: scenarios.Scenario, results: dict) -> None:
         self.assertEqual(set(scenario.repos), set(results), "zwalidowano inne repo niż zmienione")
         for repo, result in results.items():
@@ -199,16 +228,16 @@ class SingleServiceScenarioTests(ScenarioHarness):
         scenario = scenarios.S1_SINGLE_FILE
         _llm, app = self._start(scenario)
 
-        pr_button = self._require_button(app, "Wystaw PR")
-        self.assertTrue(pr_button.disabled, "PR dostępny przed walidacją")
+        deploy_button = self._require_button(app, "Wdróż na środowisko testowe")
+        self.assertTrue(deploy_button.disabled, "wdrożenie (i PR) dostępne przed walidacją")
         self.assertTrue(
-            any("zablokowany do czasu zielonej" in w.value for w in app.warning),
-            "brak informacji, dlaczego PR jest zablokowany",
+            any("zablokowane do czasu zielonej" in w.value for w in app.warning),
+            "brak informacji, dlaczego wdrożenie i PR są zablokowane",
         )
 
         app, _results = self._validate(app)
-        self.assertFalse(self._require_button(app, "Wystaw PR").disabled,
-                         "PR nadal zablokowany mimo zielonej bramki")
+        self.assertFalse(self._require_button(app, "Wdróż na środowisko testowe").disabled,
+                         "wdrożenie nadal zablokowane mimo zielonej bramki")
 
 
 class MultiFileScenarioTests(ScenarioHarness):
@@ -244,11 +273,12 @@ class MultiFileScenarioTests(ScenarioHarness):
                            "local_repo": kwargs.get("local_repo")})
             return {"success": True, "branch": "ai-change/test", "pr_url": "https://example/pr/1"}
 
-        with mock.patch("src.sandbox.open_pr_for_files", side_effect=fake_open_pr):
-            self._require_button(app, "Wystaw PR").click()
-            app = app.run()
+        app, deployed = self._open_prs_after_po_test(app, fake_open_pr)
 
-        self.assertFalse(app.exception, app.exception)
+        self.assertEqual({"shop-catalog"}, set(deployed), "na środowisko testowe trafia zmieniony serwis")
+        self.assertEqual({f.path for f in scenario.files},
+                         {f["path"] for f in deployed["shop-catalog"]["files"]},
+                         "środowisko testowe musi dostać wszystkie pliki zmiany")
         self.assertEqual(1, len(opened), "jeden serwis = dokładnie jeden PR")
         self.assertEqual("ai-bot-playground/shop-catalog", opened[0]["slug"])
         self.assertEqual(
@@ -301,7 +331,7 @@ class CrossLanguageScenarioTests(ScenarioHarness):
             app = app.run()
 
         self.assertFalse(app.exception, app.exception)
-        self.assertTrue(self._require_button(app, "Wystaw").disabled,
+        self.assertTrue(self._require_button(app, "Wdróż na środowisko testowe").disabled,
                         "PR otwarty mimo czerwonego shop-ui")
 
 
@@ -335,11 +365,12 @@ class CrossServiceScenarioTests(ScenarioHarness):
             opened.append((repo_slug, {f["path"] for f in file_changes}))
             return {"success": True, "branch": "ai-change/test", "pr_url": f"https://example/{repo_slug}"}
 
-        with mock.patch("src.sandbox.open_pr_for_files", side_effect=fake_open_pr):
-            self._require_button(app, "Wystaw").click()
-            app = app.run()
+        app, deployed = self._open_prs_after_po_test(app, fake_open_pr)
 
-        self.assertFalse(app.exception, app.exception)
+        # Do testenv trafiają wszystkie 4 repo; to testenv odfiltrowuje te spoza chartu
+        # (shop-acceptance-tests) — patrz tests/test_testenv.py.
+        self.assertEqual({"shop-order", "shop-notification", "shop-ui", "shop-acceptance-tests"},
+                         set(deployed))
         by_slug = dict(opened)
         self.assertEqual(
             {"ai-bot-playground/shop-order",
@@ -371,7 +402,7 @@ class BrokenChangeScenarioTests(ScenarioHarness):
         self.assertEqual("code", result["failure_kind"],
                          "błąd kompilatora oznaczony jako problem środowiska")
         self.assertIn("totalCount", result["output"], "log nie zawiera prawdziwego błędu javac")
-        self.assertTrue(self._require_button(app, "Wystaw").disabled,
+        self.assertTrue(self._require_button(app, "Wdróż na środowisko testowe").disabled,
                         "PR dostępny mimo czerwonej bramki")
 
     def test_s5_repair_loop_sends_the_real_log_and_turns_the_gate_green(self):
@@ -391,7 +422,7 @@ class BrokenChangeScenarioTests(ScenarioHarness):
         results = self._state(app, "sandbox_validation_results") or {}
         self.assertTrue(results["shop-catalog"]["success"],
                         f"po naprawie bramka nadal czerwona:\n{results['shop-catalog'].get('output', '')[-2000:]}")
-        self.assertFalse(self._require_button(app, "Wystaw").disabled,
+        self.assertFalse(self._require_button(app, "Wdróż na środowisko testowe").disabled,
                          "PR nadal zablokowany po zielonej walidacji")
 
 

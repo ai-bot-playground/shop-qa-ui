@@ -1,6 +1,8 @@
 # shop-qa-ui
 
-Aplikacja Streamlit — część systemu **ai-bot-playground**. Opisujesz zmianę w języku naturalnym → agent analizuje kod serwisów sklepu, planuje i generuje zmianę → lokalnie kompiluje ją i poprawia na podstawie błędów → wystawia **Pull Request do repozytorium serwisu** (bramka `preprod-gate` wykonuje pełną walidację i wdraża na preprod).
+Aplikacja Streamlit — część systemu **ai-bot-playground**. Product Owner opisuje zmianę w języku naturalnym → agent analizuje kod serwisów sklepu, planuje i generuje zmianę → lokalnie kompiluje ją i poprawia na podstawie błędów → **wdraża ją na środowisko testowe na Kubernetes i daje PO link** → dopiero gdy PO potwierdzi, że działa, wystawia **Pull Request do repozytorium serwisu** (bramka `preprod-gate` wykonuje pełną walidację na preprod) → merge z UI.
+
+Link z gotową prośbą: `http://localhost:8502/?q=<treść zmiany>` wypełnia pole pytania w kroku Analyze.
 
 ---
 
@@ -52,7 +54,8 @@ Repozytoria do indeksowania: [`manifest.yaml`](manifest.yaml).
 | **1 — System Ready** | Indeksuje serwisy `shop-*` z `manifest.yaml` (AST dla `.py`, leksykalnie dla Java/JS/TS) |
 | **2 — Analyze** | Pytanie w NL → odpowiedź z cytowaniami `repo/plik:linia` + ocena wykonalności + propozycje |
 | **3 — Piaskownica** | Planner dostaje trafne fragmenty realnego kodu; LLM generuje pliki — każdy z rolą z planu, listą pozostałych plików zmiany i treścią już wygenerowanych (np. klasa kroków widzi nowy `.feature`); obowiązkowa walidacja w izolowanym worktree; błąd wraca do LLM do poprawy |
-| **4 — PR** | PR jest dostępny dopiero po zielonej walidacji wszystkich zmienionych repo; następnie live status bramki `preprod-gate` co 15 s, podgląd na preprod i **merge z UI** (per repo, za potwierdzeniem człowieka). Anulowany check to porażka. Repo bez żadnej bramki (`main` nie wymaga checków, a po 90 s nic nie wystartowało — np. `shop-acceptance-tests`) dostaje stan „bez bramki": ostrzeżenie i merge za potwierdzeniem. Przy czerwonej bramce UI pokazuje fragment logu kończący się na pierwszym `##[error]` (także dla reusable workflow, gdzie `gh run view --log-failed` milczy). Gdy wszystkie PR-y osiągną stan końcowy, auto-odświeżanie się wyłącza |
+| **4 — Test PO** | Po zielonej walidacji „🧪 Wdróż na środowisko testowe": obrazy zmienionych serwisów budowane z worktree ze zmianą, `kind load`, pełny stos z chartu `shop-infra/helm` na **osobnym namespace** `test-<id>` klastra `kind-preprod` (bez Prometheusa/Grafany; reszta serwisów z obrazów bazowych `main`). PO dostaje linki (`http://localhost:<port>` — port-forward do UI i gatewaya, prowadzony przez aplikację) oraz instrukcję „co kliknąć i czego się spodziewać" od modelu. „✅ Działa" → PR z adnotacją o sprawdzeniu; „❌ Nie działa" + opis → uwagi wracają do Piaskownicy („🛠 Popraw zmianę według uwag PO"), potem walidacja i wdrożenie od nowa. Jedno środowisko na raz; znika po merge'u lub przyciskiem 🗑. Moduł: [`src/testenv.py`](src/testenv.py) |
+| **5 — PR** | PR powstaje dopiero po akceptacji PO (wyjątek: zmiana bez wdrażanego serwisu, np. same testy — wtedy PR od razu); następnie live status bramki `preprod-gate` co 15 s, podgląd na preprod i **merge z UI** (per repo, za potwierdzeniem człowieka). Anulowany check to porażka. Repo bez żadnej bramki (`main` nie wymaga checków, a po 90 s nic nie wystartowało — np. `shop-acceptance-tests`) dostaje stan „bez bramki": ostrzeżenie i merge za potwierdzeniem. Przy czerwonej bramce UI pokazuje fragment logu kończący się na pierwszym `##[error]` (także dla reusable workflow, gdzie `gh run view --log-failed` milczy). Gdy wszystkie PR-y osiągną stan końcowy, auto-odświeżanie się wyłącza |
 
 ### Lokalna bramka przed PR
 
@@ -67,7 +70,7 @@ Pełny workflow uruchamiaj lokalnie z JDK 25, Node/npm i lokalnymi klonami `shop
 
 ### Ograniczenia wariantu kontenerowego / k8s
 
-`Containerfile` nie zawiera JDK, Node, `gh` ani repozytoriów siostrzanych, a ConfigMap nie ustawia `SHOP_REPOS_DIR` — pod na `:8501` obsługuje więc **wyłącznie indeksowanie i analizę**. Lokalna walidacja i wystawianie PR-ów działają tylko w wariancie natywnym (`run-local.ps1`, port `8502`).
+`Containerfile` nie zawiera JDK, Node, `gh`, podmana/kind/helm ani repozytoriów siostrzanych, a ConfigMap nie ustawia `SHOP_REPOS_DIR` — pod na `:8501` obsługuje więc **wyłącznie indeksowanie i analizę**. Lokalna walidacja, środowisko testowe dla PO i wystawianie PR-ów działają tylko w wariancie natywnym (`run-local.ps1`, port `8502`) — na tej samej maszynie co klaster `kind-preprod`.
 
 ### Gradle: „Unable to establish loopback connection"
 
