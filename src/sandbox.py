@@ -24,11 +24,36 @@ def pr_checks(repo_slug: str, branch: str) -> dict:
         capture_output=True, text=True,
     )
     if r.returncode != 0 and not r.stdout.strip():
-        return {"available": False, "message": (r.stderr or "brak danych").strip(), "checks": []}
+        message = (r.stderr or "brak danych").strip()
+        # PR istnieje, ale nic go (jeszcze) nie sprawdza — to stan, nie awaria odczytu.
+        if "no checks reported" in message.lower():
+            return {"available": True, "message": message, "checks": []}
+        return {"available": False, "message": message, "checks": []}
     try:
         return {"available": True, "checks": _json.loads(r.stdout or "[]")}
     except Exception:
         return {"available": False, "message": "nie udało się odczytać statusu", "checks": []}
+
+
+def required_checks(repo_slug: str, base: str = "main") -> list[str] | None:
+    """Checki wymagane przez ochronę gałęzi `base`.
+
+    [] — gałąź bez ochrony albo bez wymaganych checków; None — nie udało się ustalić.
+    """
+    import json as _json
+    r = subprocess.run(
+        ["gh", "api", f"repos/{repo_slug}/branches/{base}/protection/required_status_checks",
+         "--jq", ".contexts"],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        try:
+            return list(_json.loads(r.stdout or "[]") or [])
+        except Exception:
+            return None
+    if "not protected" in f"{r.stdout} {r.stderr}".lower():
+        return []
+    return None
 
 
 def pr_failure_summary(repo_slug: str, branch: str, max_lines: int = 40) -> str:
@@ -51,11 +76,53 @@ def pr_failure_summary(repo_slug: str, branch: str, max_lines: int = 40) -> str:
     if not rid:
         return ""
     lg = subprocess.run(["gh", "run", "view", rid, "--repo", repo_slug, "--log-failed"],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     out = (lg.stdout or "").strip()
-    if not out:
-        return ""
-    return "\n".join(out.splitlines()[-max_lines:])
+    if out:
+        return job_log_failure_excerpt(out, max_lines)
+    # Dla jobów z reusable workflow (`preprod-gate / gate`) `--log-failed` zwraca pustkę,
+    # choć log istnieje — czytamy go wprost z API jobów.
+    jobs = subprocess.run(
+        ["gh", "api", f"repos/{repo_slug}/actions/runs/{rid}/jobs",
+         "--jq", '[.jobs[] | select(.conclusion == "failure") | .id]'],
+        capture_output=True, text=True,
+    )
+    try:
+        job_ids = _json.loads(jobs.stdout or "[]") if jobs.returncode == 0 else []
+    except Exception:
+        job_ids = []
+    excerpts = []
+    for job_id in job_ids:
+        log = subprocess.run(["gh", "api", f"repos/{repo_slug}/actions/jobs/{job_id}/logs"],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if log.returncode == 0 and log.stdout.strip():
+            excerpts.append(job_log_failure_excerpt(log.stdout, max_lines))
+    return "\n\n".join(e for e in excerpts if e)
+
+
+def job_log_failure_excerpt(log_text: str, max_lines: int = 40) -> str:
+    """Fragment logu joba GitHub Actions kończący się na pierwszym `##[error]`.
+
+    Ogon całego logu to sprzątanie i kroki `Post ...`, a przyczyna stoi tuż przed
+    pierwszym `##[error]`. Przyjmuje surowy log z API jobów oraz wyjście
+    `gh run view --log-failed` (`job<TAB>krok<TAB>linia` — krok zostaje jako `[krok]`).
+    Usuwa znaczniki czasu i kody ANSI.
+    """
+    import re
+
+    def clean(ln: str) -> tuple[str, str]:
+        step = ""
+        parts = ln.split("\t", 2)
+        if len(parts) == 3:
+            step, ln = parts[1], parts[2]
+        ln = re.sub(r"^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z ?", "", ln)
+        return step, re.sub(r"\x1b\[[0-9;]*m", "", ln)
+
+    cleaned = [clean(ln) for ln in log_text.splitlines()]
+    lines = [f"[{step}] {text}" if step else text for step, text in cleaned]
+    end = next((i for i, (_, text) in enumerate(cleaned) if text.startswith("##[error]")),
+               len(lines) - 1)
+    return "\n".join(lines[max(0, end + 1 - max_lines):end + 1]).strip()
 
 
 def merge_pr(repo_slug: str, branch: str, strategy: str = "--squash") -> dict:
@@ -108,12 +175,46 @@ def _content_syntax_error(rel_path: str, content: str) -> str:
     return ""
 
 
+_CUCUMBER_DRY_RUN_INIT = """\
+// shop-qa-ui: Cucumber dry-run — dopasowuje kroki do glue bez wykonywania ich ciał.
+allprojects {
+    tasks.withType(Test).configureEach {
+        systemProperty 'cucumber.execution.dry-run', 'true'
+    }
+}
+"""
+
+
+def _cucumber_dry_run_safe(worktree: str) -> bool:
+    """Czy da się sprawdzić kroki Cucumbera bez środowiska.
+
+    Tylko suite'y bez Springa i Testcontainers (jak shop-acceptance-tests) —
+    tam dry-run nie stawia kontekstu ani kontenerów. To repo nie ma własnej bramki
+    na PR, a samo `testClasses` przepuszcza `.feature` z niezaimplementowanymi
+    krokami, który po merge'u wywraca akceptację w KAŻDEJ bramce serwisów.
+    """
+    try:
+        with open(os.path.join(worktree, "build.gradle"), encoding="utf-8") as fh:
+            build = fh.read()
+    except OSError:
+        return False
+    return ("cucumber-junit-platform-engine" in build
+            and "cucumber-spring" not in build and "testcontainers" not in build)
+
+
 def _project_validation_commands(worktree: str) -> list[list[str]]:
     """Offline build commands for the repository type present in `worktree`."""
     gradle = "gradlew.bat" if os.name == "nt" else "gradlew"
     gradle_path = os.path.join(worktree, gradle)
     if os.path.isfile(gradle_path):
-        return [[gradle_path, "--offline", "--no-daemon", "classes", "testClasses"]]
+        commands = [[gradle_path, "--offline", "--no-daemon", "classes", "testClasses"]]
+        if _cucumber_dry_run_safe(worktree):
+            init_script = os.path.join(_clone_base(), "cucumber-dry-run.init.gradle")
+            with open(init_script, "w", encoding="utf-8") as fh:
+                fh.write(_CUCUMBER_DRY_RUN_INIT)
+            commands.append([gradle_path, "--offline", "--no-daemon",
+                             "--init-script", init_script, "test"])
+        return commands
 
     package_json = os.path.join(worktree, "package.json")
     if os.path.isfile(package_json):
@@ -175,7 +276,9 @@ def validate_file_changes(file_changes: list[dict], local_repo: str,
 
     `file_changes` accepts `{path|file_path, content|new_content}` dictionaries.
     Gradle validation compiles main and test sources but does not execute component
-    tests, so it does not start Testcontainers or local services.
+    tests, so it does not start Testcontainers or local services. Suites without
+    Spring/Testcontainers (shop-acceptance-tests) additionally get a Cucumber dry-run,
+    which fails on undefined steps.
     """
     import shutil
     import uuid
@@ -331,12 +434,26 @@ def _resolve_local_repo(local_repo: str | None, repo_slug: str) -> str | None:
     return None
 
 
+def _same_text(left: str, right: str) -> bool:
+    """Porównanie treści odporne na CRLF i końcową pustą linię."""
+    def norm(text: str) -> str:
+        return (text or "").replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+    return norm(left) == norm(right)
+
+
 def open_pr_for_files(file_changes: list[dict], title: str, body: str,
                       repo_slug: str, base: str = "main",
                       branch_prefix: str = "ai-change",
                       local_repo: str | None = None) -> dict:
     """JEDEN PR dla repo zbierający WIELE plików. `file_changes` to lista dictów
-    {path, content, allow_create}. Wszystkie pliki lądują w jednej gałęzi/commicie.
+    {path, content, allow_create, base_content}. Wszystkie pliki lądują w jednej
+    gałęzi/commicie.
+
+    `base_content` (opcjonalne) to treść, NA KTÓREJ oparto zmianę — zwykle plik
+    odczytany z lokalnego klonu. Gałąź PR-a wychodzi z `origin/{base}`, a lokalne
+    HEAD potrafi być za nim (np. po merge'u poprzedniego PR-a z tego samego UI).
+    Ponieważ wysyłamy PEŁNĄ treść pliku, rozjazd cicho skasowałby cudzą zmianę;
+    dlatego przy niezgodności odmawiamy i prosimy o odświeżenie klonu.
     """
     import shutil
     import uuid
@@ -376,6 +493,19 @@ def open_pr_for_files(file_changes: list[dict], title: str, body: str,
                 if not fc.get("allow_create"):
                     return {"success": False, "error": f"plik nie istnieje w {base}: {rel_path}"}
                 os.makedirs(os.path.dirname(target), exist_ok=True)
+            elif "base_content" in fc:
+                with open(target, encoding="utf-8", errors="replace") as fh:
+                    in_base = fh.read()
+                if not _same_text(in_base, fc["base_content"] or ""):
+                    return {
+                        "success": False,
+                        "error": (
+                            f"`{rel_path}` zmienił się w origin/{base} po tym, jak zmiana "
+                            f"powstała na lokalnym klonie. PR wysyła PEŁNĄ treść pliku, więc "
+                            f"nadpisałby tamtą zmianę. Odśwież klon (`git pull`), zaindeksuj "
+                            f"ponownie i wygeneruj zmianę na aktualnym kodzie."
+                        ),
+                    }
             with open(target, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(content if content.endswith("\n") else content + "\n")
 

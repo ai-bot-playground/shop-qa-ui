@@ -14,7 +14,7 @@ from src.agent import (
     verify_completeness, repair_file_change, _fake_llm_enabled,
 )
 from src.sandbox import (
-    compute_diff, open_pr_for_files, pr_checks, merge_pr,
+    compute_diff, open_pr_for_files, pr_checks, merge_pr, required_checks,
     pr_failure_summary, validate_file_changes, validation_passed_for_repos,
 )
 
@@ -35,17 +35,33 @@ def _lang_for(path: str) -> str:
     return "python"
 
 
-def _pr_build_state(data: dict | None) -> str:
-    """Agreguje statusy checków PR (z pr_checks) do jednego: success|pending|failure|unknown."""
+# Ile czekać, aż workflow repo bez wymaganych checków zdąży zgłosić check,
+# zanim uznamy, że to repo po prostu nie ma bramki.
+NO_GATE_GRACE_S = 90
+
+_FAILED_BUCKETS = ("fail", "failure", "error", "cancel", "cancelled", "timed_out", "startup_failure")
+
+
+def _pr_build_state(data: dict | None, required: list[str] | None = None,
+                    age_s: float | None = None) -> str:
+    """Agreguje statusy checków PR (z pr_checks) do jednego:
+    success|pending|failure|unknown|no_gate.
+
+    `required` — checki wymagane przez ochronę `main` (z required_checks), `age_s` — wiek PR-a.
+    no_gate: repo bez wymaganych checków, w którym po NO_GATE_GRACE_S nadal nic nie
+    wystartowało — czekanie dalej nic nie da, decyzja należy do człowieka.
+    """
     if not data or not data.get("available"):
         return "unknown"
     checks = data.get("checks", [])
     if not checks:
+        if required == [] and age_s is not None and age_s >= NO_GATE_GRACE_S:
+            return "no_gate"
         return "pending"  # bramka jeszcze nie wystartowała
     buckets = [(c.get("bucket") or c.get("state") or "").lower() for c in checks]
-    if any(b in ("fail", "failure", "error", "cancelled", "timed_out") for b in buckets):
+    if any(b in _FAILED_BUCKETS for b in buckets):
         return "failure"
-    if any(b in ("pending", "", "queued", "in_progress", "running", "none", "waiting", "expected", "startup_failure") for b in buckets):
+    if any(b in ("pending", "", "queued", "in_progress", "running", "none", "waiting", "expected") for b in buckets):
         return "pending"
     if all(b in ("pass", "success", "skipping", "skipped", "neutral") for b in buckets):
         return "success"
@@ -140,7 +156,10 @@ def _completed_steps() -> set:
         done.add("ready")
     if _active_messages():
         done.add("analyze")
-    if st.session_state.get("sandbox_results") or st.session_state.get("sandbox_commit_done"):
+    # `sandbox_multi_changes` to jedyny stan, który krok 3 realnie zapisuje —
+    # wcześniej stał tu `sandbox_results`, klucz, którego nikt nigdy nie ustawiał,
+    # więc Piaskownica zapalała się na „ukończoną" dopiero po wystawieniu PR-a.
+    if st.session_state.get("sandbox_multi_changes") or st.session_state.get("sandbox_commit_done"):
         done.add("sandbox")
     if st.session_state.get("sandbox_commit_done"):
         done.add("pr")
@@ -794,15 +813,20 @@ elif active_tab == "sandbox":
                 with st.spinner(f"Generuję zmiany dla {len(to_gen)}/{len(multi)} pliku/plików…"):
                     for mc in to_gen:
                         try:
+                            # Rola pliku w planie + reszta zestawu (z treściami już
+                            # wygenerowanymi) — inaczej model widzi plik w izolacji.
                             if mc.get("action") == "create":
                                 gen = generate_new_file(
                                     question, accepted_proposals,
                                     mc["repo"], mc["file_path"],
+                                    reason=mc.get("reason", ""), change_set=multi,
                                 ) or ""
                             else:
                                 gen = generate_file_change(
                                     question, accepted_proposals,
                                     mc["file_path"], mc["original"],
+                                    repo=mc["repo"], reason=mc.get("reason", ""),
+                                    change_set=multi,
                                 ) or ""
                             mc["new_content"] = gen
                             # Pusta treść z modelu = BRAK zmiany, nie usunięcie pliku.
@@ -888,7 +912,10 @@ elif active_tab == "sandbox":
 
                 verdict = st.session_state.get("sandbox_verify")
                 if verdict:
-                    if verdict["complete"]:
+                    if verdict.get("error"):
+                        st.error(f"Recenzja kompletności się nie odbyła: {verdict['error']}. "
+                                 "Spróbuj ponownie — nie traktuj tego jako „kompletne\".")
+                    elif verdict["complete"]:
                         st.success("✅ Agent: zestaw plików wygląda na kompletny.")
                     else:
                         st.warning(f"⚠️ Agent: zestaw niekompletny. {verdict.get('notes', '')}")
@@ -903,12 +930,18 @@ elif active_tab == "sandbox":
                         if st.button("➕ Dodaj brakujące do planu i wygeneruj",
                                      type="primary", use_container_width=True):
                             repo_paths = st.session_state.get("repo_paths", {})
-                            existing = {(mc["repo"], mc["file_path"]) for mc in multi}
+                            existing = {(mc["repo"], mc["file_path"]): mc for mc in multi}
                             added = 0
                             for m in verdict["missing"]:
-                                if (m["repo"] not in repo_paths
-                                        or (m["repo"], m["path"]) in existing
-                                        or m["path"].endswith(".py")):
+                                planned = existing.get((m["repo"], m["path"]))
+                                if planned is not None:
+                                    # Recenzent wskazał plik z planu, który wrócił pusty —
+                                    # wygeneruj go ponownie (teraz z treścią reszty zmiany).
+                                    if not (planned.get("new_content") or "").strip():
+                                        planned["new_content"] = None
+                                        added += 1
+                                    continue
+                                if m["repo"] not in repo_paths or m["path"].endswith(".py"):
                                     continue
                                 rpath = repo_paths[m["repo"]]
                                 action, orig = m["action"], ""
@@ -997,12 +1030,21 @@ elif active_tab == "sandbox":
                 with st.spinner("Naprawiam błędy wskazane przez lokalną walidację…"):
                     for repo in repairable_repos:
                         repo_changes = changed_by_repo[repo]
+                        # Pliki z planu, które przy generowaniu wróciły puste — log bywa
+                        # wprost o nich (np. UndefinedStepException → brak kroków w klasie
+                        # steps), a bez tego naprawa w ogóle by ich nie dotknęła.
+                        planned_empty = [
+                            mc for mc in multi
+                            if mc["repo"] == repo and not (mc.get("new_content") or "").strip()
+                            and not mc.get("error")
+                        ]
                         failure = validation_results[repo]
                         failure_context = "\n".join(filter(None, [
                             failure.get("error", ""), failure.get("output", ""),
                         ]))
-                        for mc in repo_changes:
-                            current = mc.get("new_content") or ""
+                        for mc in repo_changes + planned_empty:
+                            # Pusty plik z planu oceniamy na jego treści wyjściowej.
+                            current = mc.get("new_content") or mc.get("original") or ""
                             try:
                                 repaired = repair_file_change(
                                     question,
@@ -1023,6 +1065,11 @@ elif active_tab == "sandbox":
                                 )
                                 mc["error"] = None
                                 repaired_count += 1
+                        repo_changes = [
+                            mc for mc in multi
+                            if mc["repo"] == repo and (mc.get("diff") or "").strip()
+                            and (mc.get("new_content") or "").strip()
+                        ]
                         updated_results[repo] = validate_file_changes(
                             repo_changes,
                             repo_changes[0]["repo_path"],
@@ -1084,7 +1131,11 @@ elif active_tab == "sandbox":
                         for repo, mcs in pending_by_repo.items():
                             files = [
                                 {"path": mc["file_path"], "content": mc["new_content"],
-                                 "allow_create": mc.get("action") == "create"}
+                                 "allow_create": mc.get("action") == "create",
+                                 # Treść, na której oparto zmianę — sandbox porówna ją
+                                 # z origin/main i odmówi, gdy plik zdążył się tam zmienić
+                                 # (PR niesie pełny plik, więc cicho skasowałby tamtą zmianę).
+                                 "base_content": mc.get("original") or ""}
                                 for mc in mcs
                             ]
                             rs = open_pr_for_files(
@@ -1116,6 +1167,7 @@ elif active_tab == "sandbox":
                                 "success": pr.get("success", False),
                                 "error": pr.get("error", ""),
                                 "warning": pr.get("warning", ""),
+                                "opened_at": datetime.now().timestamp(),
                             }
                         st.session_state.qa_multi_prs = list(by_repo_pr.values())
                         _advance()
@@ -1158,14 +1210,16 @@ elif active_tab == "pr":
 
         merged: dict = st.session_state.setdefault("qa_merged", {})
         gate_states: dict = st.session_state.setdefault("qa_gate_states", {})
+        # Ochrona `main` nie zmienia się w trakcie przebiegu — jedno `gh api` na repo.
+        required_by_slug: dict = st.session_state.setdefault("qa_required_checks", {})
 
         # Auto-odświeżanie TYLKO dopóki któryś PR czeka na bramkę. Gdy wszystkie
-        # doszły do stanu terminalnego (zielony/czerwony/zmergowany), polling się
-        # wyłącza: nie wołamy `gh` bez potrzeby i nie przerywamy klikania merge.
+        # doszły do stanu terminalnego (zielony/czerwony/bez bramki/zmergowany),
+        # polling się wyłącza: nie wołamy `gh` bez potrzeby i nie przerywamy klikania merge.
         awaiting = [
             pr for pr in multi_prs
             if pr["success"] and not merged.get(pr["repo_slug"])
-            and gate_states.get(pr["repo_slug"], "unknown") not in ("success", "failure")
+            and gate_states.get(pr["repo_slug"], "unknown") not in ("success", "failure", "no_gate")
         ]
         st.caption(
             f"{len(opened)}/{len(multi_prs)} otwartych pomyślnie. "
@@ -1214,7 +1268,7 @@ elif active_tab == "pr":
         @st.fragment(run_every=15 if awaiting else None)
         def _pr_status_panel():
             agg = {"success": 0, "pending": 0, "failure": 0, "unknown": 0,
-                   "nieotwarte": 0, "merged": 0}
+                   "no_gate": 0, "nieotwarte": 0, "merged": 0}
             rows = []
             for pr in multi_prs:
                 slug = pr["repo_slug"]
@@ -1227,23 +1281,30 @@ elif active_tab == "pr":
                     rows.append((pr, "merged", None))
                     continue
                 data = pr_checks(slug, pr["branch"]) if pr.get("branch") else None
-                state = _pr_build_state(data)
+                if data and data.get("available") and not data.get("checks"):
+                    if required_by_slug.get(slug) is None:
+                        required_by_slug[slug] = required_checks(slug)
+                    age_s = (datetime.now().timestamp() - pr["opened_at"]) if pr.get("opened_at") else None
+                    state = _pr_build_state(data, required_by_slug[slug], age_s)
+                else:
+                    state = _pr_build_state(data)
                 gate_states[slug] = state
                 agg[state] = agg.get(state, 0) + 1
                 rows.append((pr, state, data))
 
-            c1, c2, c3, c4, c5 = st.columns(5)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("✅ Success", agg["success"])
             c2.metric("⏳ Pending", agg["pending"] + agg["unknown"])
             c3.metric("❌ Failed", agg["failure"])
-            c4.metric("⚠️ Nieotwarte", agg["nieotwarte"])
-            c5.metric("🔀 Zmergowane", agg["merged"])
+            c4.metric("🚧 Bez bramki", agg["no_gate"])
+            c5.metric("⚠️ Nieotwarte", agg["nieotwarte"])
+            c6.metric("🔀 Zmergowane", agg["merged"])
 
-            icons = {"success": "✅", "pending": "⏳", "failure": "❌",
+            icons = {"success": "✅", "pending": "⏳", "failure": "❌", "no_gate": "🚧",
                      "unknown": "⏳", "nieotwarte": "⚠️", "merged": "🔀"}
             for pr, state, data in rows:
                 with st.expander(f"{icons[state]} `{pr['repo_slug']}` — {state}",
-                                 expanded=state in ("failure", "nieotwarte")):
+                                 expanded=state in ("failure", "nieotwarte", "no_gate")):
                     if state == "nieotwarte":
                         if pr.get("warning"):
                             st.warning(pr["warning"])
@@ -1261,6 +1322,13 @@ elif active_tab == "pr":
                     if state == "success":
                         st.success("Bramka zielona — kandydat wdrożony na preprod.")
                         _merge_section(pr)
+                    elif state == "no_gate":
+                        st.warning(
+                            "To repo nie ma bramki CI: `main` nie wymaga żadnego checka, a po "
+                            f"{NO_GATE_GRACE_S} s żaden workflow nie wystartował. Zmianę sprawdziła "
+                            "wyłącznie lokalna walidacja — przejrzyj PR sam, zanim go zmergujesz."
+                        )
+                        _merge_section(pr)
                     elif state == "pending":
                         st.info("Build w toku — bramka `preprod-gate` jeszcze się wykonuje.")
                     elif state == "failure":
@@ -1271,8 +1339,7 @@ elif active_tab == "pr":
                         # Które checki padły (+ linki do logów na GitHub).
                         failed_checks = [
                             c for c in (data or {}).get("checks", [])
-                            if (c.get("bucket") or c.get("state") or "").lower()
-                            in ("fail", "failure", "error", "cancelled", "timed_out")
+                            if (c.get("bucket") or c.get("state") or "").lower() in _FAILED_BUCKETS
                         ]
                         if failed_checks:
                             st.markdown("**Nieudane checki:**")

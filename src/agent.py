@@ -210,6 +210,11 @@ def _call_openrouter(system: str, user_content: str, max_tokens: int,
     }
     # Thinking bywa wolny — dłuższy timeout.
     resp = requests.post(_OPENROUTER_ENDPOINT, headers=headers, json=payload, timeout=300)
+    if light and resp.status_code == 400 and "reasoning is mandatory" in resp.text.lower():
+        # Modele z obowiązkowym rozumowaniem (np. openai/gpt-6.1-sol) odrzucają
+        # `enabled: false` — tanie wywołanie idzie wtedy na najniższym wysiłku.
+        payload["reasoning"] = {"effort": "low"}
+        resp = requests.post(_OPENROUTER_ENDPOINT, headers=headers, json=payload, timeout=300)
     resp.raise_for_status()
     data = resp.json()
     _emit_token_metrics(_OPENROUTER_MODEL, data.get("usage") or {})
@@ -299,9 +304,12 @@ Zasady:
 1. Zwróć WYŁĄCZNIE pełną, zaktualizowaną treść TEGO pliku — bez wyjaśnień, bez markdown, bez ```.
 2. Zachowaj wszystko bez zmian poza żądaną modyfikacją (importy, formatowanie, resztę kodu).
 3. Kod musi pozostać kompilowalny i zgodny ze stylem/konwencjami projektu (Java/Spring).
-4. Jeśli ten plik NIE jest związany z żądaną zmianą albo zmiany nie da się w nim bezpiecznie
-   wykonać — odpowiedz DOKŁADNIE jednym słowem: BRAK_ZMIAN (bez cudzysłowów, bez nic więcej).
-   NIE zwracaj pustego pliku ani opisu — sam token BRAK_ZMIAN.\
+4. Jeśli prompt zawiera „ZADANIE TEGO PLIKU W PLANIE", plik został wybrany do tej zmiany —
+   ZREALIZUJ to zadanie, spójnie z pozostałymi plikami zmiany (np. kroki Cucumbera muszą
+   pasować DOKŁADNIE do fraz z nowego pliku .feature).
+5. BRAK_ZMIAN tylko wtedy, gdy plik już realizuje swoje zadanie albo nie ma żadnego związku
+   ze zmianą — odpowiedz wtedy DOKŁADNIE jednym słowem: BRAK_ZMIAN (bez cudzysłowów, bez nic
+   więcej). NIE zwracaj pustego pliku ani opisu — sam token BRAK_ZMIAN.\
 """
 
 # Sentinel + echo-frazy oznaczające „ten plik nie jest celem zmiany". Model bywa
@@ -398,7 +406,8 @@ Zasady:
 1. Zwróć WYŁĄCZNIE pełną treść nowego pliku — bez wyjaśnień, bez markdown, bez ```.
 2. Kod kompilowalny i zgodny ze stylem/konwencjami warstwy (Java/Spring dla serwisów,
    React/Vite/JSX dla shop-ui).
-3. Plik ma realizować swoją część żądanej zmiany (zgodnie z jego ścieżką/warstwą).
+3. Plik ma realizować swoją część żądanej zmiany (zgodnie z jego ścieżką/warstwą oraz
+   „ZADANIE TEGO PLIKU W PLANIE", jeśli jest podane), spójnie z pozostałymi plikami zmiany.
 4. Jeśli tego pliku nie da się sensownie utworzyć dla tej zmiany — odpowiedz DOKŁADNIE jednym
    słowem: BRAK_ZMIAN.\
 """
@@ -426,22 +435,60 @@ def _strip_fences(text: str) -> str:
     return t.strip("\n")
 
 
+def _change_set_context(repo: str, file_path: str, reason: str,
+                        change_set: list[dict] | None, budget: int = 24000) -> str:
+    """Rola pliku w planie + reszta zestawu zmiany (plan i już wygenerowane treści).
+
+    Bez tego model generuje każdy plik w izolacji: widzi tylko pytanie i propozycje,
+    więc np. klasa kroków Cucumbera nie wie, że w tej samej zmianie powstaje nowy
+    `.feature` z konkretnymi frazami — i rozsądnie odpowiada BRAK_ZMIAN.
+    """
+    lines = [f"ZADANIE TEGO PLIKU W PLANIE: {reason}"] if reason else []
+    others = [
+        c for c in (change_set or [])
+        if not (c.get("repo") == repo and c.get("file_path") == file_path)
+    ]
+    if others:
+        lines.append("POZOSTAŁE PLIKI TEJ SAMEJ ZMIANY (plan):")
+        lines += [
+            f"- {c.get('repo')}/{c.get('file_path')} [{c.get('action', 'modify')}]"
+            + (f" — {c['reason']}" if c.get("reason") else "")
+            for c in others
+        ]
+        generated = [c for c in others if (c.get("new_content") or "").strip()]
+        if generated:
+            lines.append("JUŻ WYGENEROWANE PLIKI TEJ ZMIANY (trzymaj się ich nazw, fraz i kontraktów):")
+            for c in generated:
+                section = f"### {c.get('repo')}/{c.get('file_path')}\n{c['new_content'][:6000]}"
+                if budget - len(section) < 0:
+                    break
+                lines.append(section)
+                budget -= len(section)
+    return "\n".join(lines)
+
+
 def generate_file_change(question: str, proposals: list[dict],
-                         file_path: str, file_source: str) -> str:
+                         file_path: str, file_source: str, *, repo: str = "",
+                         reason: str = "", change_set: list[dict] | None = None) -> str:
     """Return the FULL updated content of one file for the requested change.
 
     Robust alternative to LLM-emitted unified diffs (which often produce corrupt
     patches): the model returns the whole file, and git computes the real diff.
     Returns an empty string when no change can be made (incl. demo mode).
+    `reason`/`change_set` — rola pliku w planie i reszta zmiany (patrz _change_set_context).
     """
     props = "\n".join(
         f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or [])
     )
+    context = _change_set_context(repo, file_path, reason, change_set)
     user_msg = (
         f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
         f"{_CONSISTENCY_RULES}\n\n"
+        # Plik docelowy MUSI być pierwszym blokiem ``` w prompcie (atrapa i model skryptowy
+        # biorą treść z pierwszego bloku po „PLIK:"), dlatego kontekst zmiany stoi niżej.
         f"PLIK: {file_path}\n```\n{file_source}\n```\n\n"
-        f"ŻĄDANA ZMIANA: {question}\n"
+        + (f"{context}\n\n" if context else "")
+        + f"ŻĄDANA ZMIANA: {question}\n"
         f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
         f"Zwróć pełną zaktualizowaną treść pliku:"
     )
@@ -521,6 +568,8 @@ def verify_completeness(question: str, proposals: list[dict], repo_map: str,
 
     `generated_files`: lista {repo, path, action, status: ok|empty, head}.
     Zwraca {complete: bool, notes: str, missing: [{repo, path, action, reason}]}.
+    Gdy recenzja się nie odbyła (błąd wywołania / nieczytelny JSON), dokłada `error`
+    i `complete: False` — brak recenzji to nie to samo co „kompletne".
     """
     listing = "\n\n".join(
         f"### {g['repo']}/{g['path']}  [{g.get('action', 'modify')}, {g.get('status', 'ok')}]\n"
@@ -539,8 +588,8 @@ def verify_completeness(question: str, proposals: list[dict], repo_map: str,
     )
     try:
         data = _extract_json(_call(_VERIFY_SYSTEM, user_msg, max_tokens=2048))
-    except Exception:
-        return {"complete": True, "notes": "", "missing": []}
+    except Exception as exc:
+        return {"complete": False, "notes": "", "missing": [], "error": str(exc) or type(exc).__name__}
     missing: list[dict] = []
     seen: set = set()
     for f in (data.get("missing") or []):
@@ -562,16 +611,19 @@ def verify_completeness(question: str, proposals: list[dict], repo_map: str,
     }
 
 
-def generate_new_file(question: str, proposals: list[dict], repo: str, file_path: str) -> str:
+def generate_new_file(question: str, proposals: list[dict], repo: str, file_path: str, *,
+                      reason: str = "", change_set: list[dict] | None = None) -> str:
     """Pełna treść NOWEGO pliku (action=create z planu). "" gdy nie da się utworzyć/demo."""
     props = "\n".join(
         f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or [])
     )
+    context = _change_set_context(repo, file_path, reason, change_set)
     user_msg = (
         f"KONTEKST SYSTEMU:\n{_SHOP_FACTS}\n\n"
         f"{_CONSISTENCY_RULES}\n\n"
         f"NOWY PLIK DO UTWORZENIA: {repo}/{file_path}\n\n"
-        f"ŻĄDANA ZMIANA: {question}\n"
+        + (f"{context}\n\n" if context else "")
+        + f"ŻĄDANA ZMIANA: {question}\n"
         f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
         f"Zwróć pełną treść nowego pliku:"
     )
