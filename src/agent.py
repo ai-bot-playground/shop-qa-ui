@@ -45,7 +45,8 @@ System docelowy: sklep flash-sale na mikroserwisach (organizacja ai-bot-playgrou
 - Stack: Spring Boot 4 / Java 25 / Gradle; React/Vite (shop-ui); Postgres (database-per-service), Redis, Kafka (KRaft).
 - Serwisy: shop-gateway (Spring Cloud Gateway, /api/* -> serwisy, StripPrefix), shop-catalog (katalog + Flyway seed + Caffeine cache + test-support), shop-inventory (atomowa rezerwacja Redis Lua + outbox + idempotencja), shop-order (saga: reserve -> pay -> confirm / kompensacja + outbox multi-topic + timeout scanner), shop-payment (mock PSP; deterministyczny decline gdy kwota konczy sie na .66), shop-notification (konsument terminalnych zdarzen Order*, idempotentny).
 - Komunikacja: Kafka topics order-events, inventory-events, payment-events (+ .DLT); wzorzec outbox + idempotencja.
-- Testy: per-serwis Cucumber + Testcontainers (component); shop-acceptance-tests (cross-service przez gateway: happy / out-of-stock / payment-declined).
+- Testy: per-serwis Cucumber + Testcontainers (component); shop-acceptance-tests (cross-service przez gateway: happy / out-of-stock / payment-declined). shop-ui NIE ma test runnera (brak vitest/jest/testing-library) — jego zmianę sprawdza Product Owner na środowisku testowym i smoke bramki ui-preprod-gate.
+- Zależności: lockfile (package-lock.json) i cache offline lokalnej bramki NIE mogą być zaktualizowane przez agenta — nie dodawaj nowych bibliotek ani narzędzi (npm/Gradle); korzystaj z tego, co już jest w projekcie.
 - Bramka jakosci: PR do main -> preprod-gate (component tests -> build obrazu -> deploy kind-preprod -> acceptance). Tylko zielona bramka pozwala na merge.
 """
 
@@ -71,11 +72,15 @@ potrzebną (myśl w tej kolejności: dane → logika → zdarzenia → API → f
      shop-gateway `application.yml` (`/api/...` -> serwis, `StripPrefix=1`).
   5. FRONTEND: shop-ui (React/JSX), jeśli zmiana jest widoczna dla użytkownika; wołaj przez
      `/api/*` (gateway); przy zapisie zachowaj nagłówek `Idempotency-Key`.
-  6. KONFIGURACJA: `application.yml` (properties, flagi np. `shop.test-support.enabled`),
-     `build.gradle` (nowe zależności). Env w helm/compose tylko jeśli konieczne.
+  6. KONFIGURACJA: `application.yml` (properties, flagi np. `shop.test-support.enabled`).
+     NIE dodawaj zależności do `build.gradle`/`package.json` i nie planuj lockfile'ów — agent
+     nie umie ich zaktualizować, a lokalna bramka działa offline. Env w helm/compose tylko
+     jeśli konieczne.
   7. TESTY: zaktualizuj/dodaj scenariusze — per-serwis Cucumber (`.feature` + kroki),
      a dla zmian obserwowalnych cross-service scenariusz w shop-acceptance-tests. Testy są
-     CZĘŚCIĄ zmiany (bramka je uruchamia), nie opcją.
+     CZĘŚCIĄ zmiany (bramka je uruchamia), nie opcją — ale tylko w istniejących frameworkach;
+     zmiany czysto wizualne w shop-ui nie dostają testów jednostkowych (brak runnera, sprawdza
+     je PO na środowisku testowym).
 
 KROK 2 — JEDEN SŁOWNIK (spójność między plikami). Zanim wygenerujesz pliki, ustal RAZ i używaj
 DOKŁADNIE tych samych nazw we wszystkich plikach: pola/kolumny, wartości `type` zdarzeń, nazwy
@@ -99,7 +104,8 @@ zaktualizuj mapowanie/użycie; importujesz nową klasę → utwórz ją).
 KROK 5 — DEFINICJA UKOŃCZENIA (= bramka preprod-gate). Zestaw plików musi: (a) się kompilować,
 (b) utrzymać zielone testy komponentowe każdego dotkniętego serwisu (zaktualizuj je, jeśli
 zmieniłeś zachowanie), (c) utrzymać/rozszerzyć zielony pakiet akceptacyjny cross-service.
-Zmieniasz zachowanie widoczne z zewnątrz → test to potwierdzający MUSI być w planie.\
+Zmieniasz zachowanie widoczne z zewnątrz → test to potwierdzający MUSI być w planie (w istniejącym
+frameworku testów danego repo; nowego frameworka ani zależności nie dodawaj).\
 """
 
 # Skrócone zasady spójności — wstrzykiwane przy generowaniu POJEDYNCZEGO pliku
@@ -691,6 +697,23 @@ Zasady:
 """
 
 
+_PO_CHECKS_SYSTEM = """\
+Przygotowujesz dla Product Ownera (osoby nietechnicznej) krótką instrukcję sprawdzenia
+zmiany na ŚRODOWISKU TESTOWYM, zanim powstanie PR. Dostajesz żądaną zmianę, listę
+zmienionych plików i adresy środowiska (UI sklepu oraz API przez gateway).
+
+Odpowiedz WYŁĄCZNIE prawidłowym JSON (bez markdown):
+{"checks": [{"title": "<co sprawdzić, 1 zdanie>", "url": "<pełny adres do kliknięcia>",
+             "expect": "<co PO ma zobaczyć, konkretnie>"}]}
+
+Zasady:
+- 1–4 kroki, od najważniejszego. Każdy `url` MUSI zaczynać się od jednego z podanych adresów.
+- UI (`/`) gdy zmiana jest widoczna w sklepie; GET endpointu API (np. `/api/products`,
+  `/api/inventory/1`) gdy da się ją potwierdzić odpowiedzią JSON w przeglądarce.
+- Tylko GET — PO klika link w przeglądarce; zakupy opisuj jako kroki w UI.
+- Po polsku, bez żargonu.\
+"""
+
 # Mapa promptów systemowych → rodzaje odpowiedzi atrapy offline (QA_FAKE_LLM=1).
 # Musi stać PO definicjach wszystkich promptów; `_call` sięga po nią w czasie
 # wywołania, nie importu. Nieobecny prompt → atrapa zwraca BRAK_ZMIAN.
@@ -702,7 +725,40 @@ _FAKE_KINDS = {
     _VERIFY_SYSTEM: "verify",
     _FILECHANGE_SYSTEM: "filechange",
     _NEWFILE_SYSTEM: "newfile",
+    _PO_CHECKS_SYSTEM: "pochecks",
 }
+
+
+def propose_po_checks(question: str, proposals: list[dict], changed_files: list[str],
+                      urls: dict[str, str]) -> list[dict]:
+    """Instrukcja dla PO: co kliknąć na środowisku testowym i czego się spodziewać.
+
+    Zwraca [{title, url, expect}]. Adresy spoza `urls` są odrzucane (model nie może
+    wysłać PO gdzie indziej); przy błędzie modelu — sam link do UI.
+    """
+    fallback = [{"title": "Otwórz sklep na środowisku testowym", "url": urls.get("ui", ""),
+                 "expect": "Sklep się ładuje; sprawdź opisaną zmianę."}] if urls.get("ui") else []
+    props = "\n".join(f"- {p.get('title', '')}: {p.get('description', '')}" for p in (proposals or []))
+    user_msg = (
+        f"ŻĄDANA ZMIANA: {question}\n"
+        f"Zaakceptowane propozycje:\n{props or '(brak)'}\n\n"
+        f"ZMIENIONE PLIKI:\n" + "\n".join(f"- {f}" for f in changed_files) + "\n\n"
+        f"ADRESY ŚRODOWISKA TESTOWEGO:\n"
+        + "\n".join(f"{name.upper()}: {url}" for name, url in urls.items())
+        + "\n\nZwróć instrukcję jako JSON:"
+    )
+    try:
+        data = _extract_json(_call(_PO_CHECKS_SYSTEM, user_msg, max_tokens=1024, light=True))
+    except Exception:
+        return fallback
+    bases = tuple(u.rstrip("/") for u in urls.values() if u)
+    checks = [
+        {"title": (c.get("title") or "").strip(), "url": (c.get("url") or "").strip(),
+         "expect": (c.get("expect") or "").strip()}
+        for c in (data.get("checks") or [])
+        if isinstance(c, dict) and (c.get("url") or "").strip().startswith(bases)
+    ]
+    return checks[:4] or fallback
 
 
 def expand_query(question: str) -> list[str]:

@@ -17,6 +17,8 @@ from src.sandbox import (
     compute_diff, open_pr_for_files, pr_checks, merge_pr, required_checks,
     pr_failure_summary, validate_file_changes, validation_passed_for_repos,
 )
+from src.agent import propose_po_checks
+from src.testenv import deploy_test_env, destroy_test_env, links_alive, reconnect_links
 
 
 def _lang_for(path: str) -> str:
@@ -146,6 +148,7 @@ STEPS = [
     ("ready",   "System Ready"),
     ("analyze", "Analyze"),
     ("sandbox", "Piaskownica"),
+    ("test",    "Test PO"),
     ("pr",      "PR"),
 ]
 STEP_KEYS = [k for k, _ in STEPS]
@@ -161,6 +164,9 @@ def _completed_steps() -> set:
     # więc Piaskownica zapalała się na „ukończoną" dopiero po wystawieniu PR-a.
     if st.session_state.get("sandbox_multi_changes") or st.session_state.get("sandbox_commit_done"):
         done.add("sandbox")
+    # Test PO: zmiana stała na środowisku testowym i PO ją potwierdził (albo PR już jest).
+    if st.session_state.get("qa_po_confirmed") or st.session_state.get("sandbox_commit_done"):
+        done.add("test")
     if st.session_state.get("sandbox_commit_done"):
         done.add("pr")
     return done
@@ -170,6 +176,72 @@ def _advance():
     if idx < len(STEPS) - 1:
         st.session_state.active_tab = STEP_KEYS[idx + 1]
         st.rerun()
+
+# Pliki, których model nie wygeneruje poprawnie (tysiące linii z hashami) — generuje je
+# menedżer pakietów. W planie dawały pusty plik i wieczne „niekompletne" u recenzenta.
+_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "gradle.lockfile")
+
+
+def _is_lockfile(path: str) -> bool:
+    return os.path.basename(path or "") in _LOCKFILES
+
+
+def _changes_by_repo(multi: list[dict]) -> dict[str, list[dict]]:
+    """Pliki z realnym diffem, pogrupowane po repo (jeden PR / jedno wdrożenie na repo)."""
+    out: dict[str, list[dict]] = {}
+    for mc in multi or []:
+        if (mc.get("diff") or "").strip() and (mc.get("new_content") or "").strip():
+            out.setdefault(mc["repo"], []).append(mc)
+    return out
+
+
+def _open_prs(multi: list[dict], pr_title: str, body: str) -> bool:
+    """Jeden PR na repo; zapisuje wynik do `qa_multi_prs` (krok 4). True gdy wszystkie próby się odbyły."""
+    for repo, mcs in _changes_by_repo(multi).items():
+        files = [
+            {"path": mc["file_path"], "content": mc["new_content"],
+             "allow_create": mc.get("action") == "create",
+             # Treść, na której oparto zmianę — sandbox porówna ją z origin/main
+             # i odmówi, gdy plik zdążył się tam zmienić (PR niesie pełny plik,
+             # więc cicho skasowałby tamtą zmianę).
+             "base_content": mc.get("original") or ""}
+            for mc in mcs
+        ]
+        rs = open_pr_for_files(
+            files, pr_title.strip() or f"change: {repo}", body,
+            f"ai-bot-playground/{repo}", local_repo=mcs[0]["repo_path"],
+        )
+        for mc in mcs:  # ten sam wynik PR dla wszystkich plików repo
+            mc["pr_result"] = rs
+    if not all(mc.get("pr_result") is not None for mc in multi if (mc.get("diff") or "").strip()):
+        return False
+    st.session_state.sandbox_commit_done = "multi"
+    by_repo_pr: dict = {}
+    for mc in multi:
+        if not (mc.get("diff") or "").strip():
+            continue
+        pr = mc.get("pr_result") or {}
+        by_repo_pr[mc["repo"]] = {
+            "repo": mc["repo"],
+            "repo_slug": f"ai-bot-playground/{mc['repo']}",
+            "pr_url": pr.get("pr_url", ""),
+            "branch": pr.get("branch", ""),
+            "success": pr.get("success", False),
+            "error": pr.get("error", ""),
+            "warning": pr.get("warning", ""),
+            "opened_at": datetime.now().timestamp(),
+        }
+    st.session_state.qa_multi_prs = list(by_repo_pr.values())
+    return True
+
+
+def _drop_test_env() -> None:
+    env = st.session_state.get("qa_test_env")
+    if env and env.get("namespace"):
+        destroy_test_env(env)
+    st.session_state.qa_test_env = None
+    st.session_state.qa_po_checks = []
+
 
 def _load_app_options():
     """Czyta manifest.yaml i zwraca (lista_aplikacji, domyślne_id_app).
@@ -318,6 +390,12 @@ with st.sidebar:
         st.caption("🟡 atrapa offline (QA_FAKE_LLM=1) — bez wywołań modelu")
     else:
         st.caption(f"🟢 {os.environ.get('OPENROUTER_MODEL', 'z-ai/glm-5.2')}")
+
+# ── Link z gotowym pytaniem (?q=…) — np. PO dostaje link z treścią prośby ─────
+# Wypełnia pole pytania w kroku Analyze; samo pytanie i tak trzeba wysłać przyciskiem.
+if "q" in st.query_params:
+    st.session_state.context_prefill = st.query_params["q"]
+    del st.query_params["q"]
 
 # ── Sync query params → session state (stepper link navigation) ───────────────
 if "step" in st.query_params:
@@ -472,12 +550,17 @@ elif active_tab == "analyze":
         st.warning("Najpierw zaindeksuj aplikację (panel boczny).")
     else:
         # ── Pole pytania (główna akcja, na samej górze) ──
-        prefill = st.session_state.pop("context_prefill", "")
+        # Stały klucz + wpis do session_state zamiast `value=prefill`: bez klucza zmiana
+        # wartości domyślnej (prefill zdejmowany przy pierwszym renderze) tworzy w Streamlicie
+        # NOWY widżet, więc po kliknięciu „Zapytaj" pytanie z prefillu przychodziło puste.
+        prefill = st.session_state.pop("context_prefill", None)
+        if prefill is not None:
+            st.session_state["qa_question_input"] = prefill
         col_q, col_btn = st.columns([5, 1])
         with col_q:
             question = st.text_area(
                 "Pytanie",
-                value=prefill,
+                key="qa_question_input",
                 placeholder=(
                     "np. Dlaczego anulowanie zamówienia cicho nie działa?\n"
                     "    Jak obliczana jest opłata za opóźnienie?\n"
@@ -742,7 +825,7 @@ elif active_tab == "sandbox":
             targets: list[dict] = []
             for pf in plan:
                 repo, path, action = pf["repo"], pf["path"], pf["action"]
-                if repo not in repo_paths or path.endswith(".py"):
+                if repo not in repo_paths or path.endswith(".py") or _is_lockfile(path):
                     continue
                 if (repo, path) in seen_keys:
                     continue
@@ -941,7 +1024,8 @@ elif active_tab == "sandbox":
                                         planned["new_content"] = None
                                         added += 1
                                     continue
-                                if m["repo"] not in repo_paths or m["path"].endswith(".py"):
+                                if (m["repo"] not in repo_paths or m["path"].endswith(".py")
+                                        or _is_lockfile(m["path"])):
                                     continue
                                 rpath = repo_paths[m["repo"]]
                                 action, orig = m["action"], ""
@@ -963,6 +1047,44 @@ elif active_tab == "sandbox":
                             if added:
                                 st.toast(f"Dodano {added} plik(ów) do planu — generuję…")
                             st.rerun()
+
+            # ── Uwagi PO z testu na środowisku testowym → poprawka przez agenta ──
+            po_feedback = st.session_state.get("sandbox_po_feedback")
+            if po_feedback:
+                st.markdown("---")
+                st.warning(f"**Uwagi Product Ownera** po teście na `{po_feedback['namespace']}`:\n\n"
+                           f"{po_feedback['text']}")
+                col_fix, col_ignore = st.columns(2)
+                if col_fix.button("🛠 Popraw zmianę według uwag PO", type="primary",
+                                  use_container_width=True):
+                    context = (
+                        "UWAGI PRODUCT OWNERA po sprawdzeniu zmiany na działającym środowisku "
+                        f"testowym (to jest źródło prawdy — zmiana NIE spełnia oczekiwań):\n{po_feedback['text']}"
+                    )
+                    fixed = 0
+                    with st.spinner("Poprawiam pliki według uwag PO…"):
+                        for repo, repo_changes in _changes_by_repo(multi).items():
+                            for mc in repo_changes:
+                                try:
+                                    repaired = repair_file_change(
+                                        question, accepted_proposals, repo, mc["file_path"],
+                                        mc["new_content"], context, repo_changes,
+                                    )
+                                except Exception as exc:
+                                    mc["error"] = str(exc)
+                                    continue
+                                if repaired.strip() and repaired != mc["new_content"]:
+                                    mc["new_content"] = repaired
+                                    mc["diff"] = compute_diff(mc["original"], repaired, mc["file_path"])
+                                    fixed += 1
+                    st.session_state.sandbox_po_feedback = None
+                    st.session_state.sandbox_validation_results = {}  # zmiana inna → walidacja od nowa
+                    st.session_state.sandbox_verify = None
+                    st.toast(f"Poprawiono {fixed} plik(ów) — uruchom walidację i wdróż ponownie.")
+                    st.rerun()
+                if col_ignore.button("Pomiń uwagi", use_container_width=True):
+                    st.session_state.sandbox_po_feedback = None
+                    st.rerun()
 
             # ── Lokalna bramka przed PR: worktree → build → log → naprawa → build ──
             changed_by_repo: dict[str, list[dict]] = {}
@@ -1097,84 +1219,78 @@ elif active_tab == "sandbox":
                 else:
                     st.error(f"❌ `{mc['repo']}`: {pr.get('error', 'nieznany błąd')}")
 
-            # Przycisk wystawiania PRów — testy lokalne NIE blokują (walidacja w CI).
+            # Po zielonej walidacji: wdrożenie na środowisko testowe dla PO. PR powstaje
+            # dopiero w kroku „Test PO", gdy Product Owner potwierdzi, że zmiana działa.
             pending = [
                 mc for mc in multi
                 if mc.get("pr_result") is None and (mc.get("diff") or "").strip()
             ]
             if pending and has_any_diff:
-                # Grupuj zmiany po repo — JEDEN PR per repo zbiera wszystkie jego pliki.
-                pending_by_repo: dict = {}
-                for mc in pending:
-                    pending_by_repo.setdefault(mc["repo"], []).append(mc)
+                pending_by_repo = _changes_by_repo(pending)
                 n_repos_p = len(pending_by_repo)
-                default_title = (
-                    accepted_proposals[0].get("commit_hint") if accepted_proposals
-                    else f"change: {n_repos_p} serwisów"
-                )
-                pr_title = st.text_input("Tytuł PR / commit", value=default_title or "change")
                 if not validation_ready:
                     st.warning(
-                        "PR jest zablokowany do czasu zielonej lokalnej walidacji "
-                        "każdego zmienionego repo."
+                        "Wdrożenie na środowisko testowe i PR są zablokowane do czasu zielonej "
+                        "lokalnej walidacji każdego zmienionego repo."
                     )
                 st.caption(
-                    "Po lokalnej walidacji CI (`preprod-gate`) pozostaje drugą, pełną bramką."
+                    "Zmiana trafi na osobny namespace klastra `kind-preprod` z pełnym stosem. "
+                    "Product Owner dostanie link do działającej aplikacji; PR powstanie dopiero "
+                    "po jego akceptacji (dalej pełna bramka `preprod-gate`)."
                 )
+                env = st.session_state.get("qa_test_env")
+                if env and env.get("success"):
+                    st.info(f"Środowisko testowe działa: `{env['namespace']}`.")
+                    if st.button("Przejdź do Test PO →", type="primary"):
+                        st.session_state.active_tab = "test"
+                        st.rerun()
                 if st.button(
-                    f"🚀 Wystaw {'PR' if n_repos_p == 1 else f'{n_repos_p} PRy/PRów'} "
-                    f"({n_repos_p} {'repozytorium' if n_repos_p == 1 else 'repozytoria/repozytoriów'})",
-                    type="primary", use_container_width=True,
-                    disabled=not validation_ready,
+                    f"🧪 Wdróż na środowisko testowe ({n_repos_p} "
+                    f"{'repozytorium' if n_repos_p == 1 else 'repozytoria/repozytoriów'})",
+                    type="secondary" if env and env.get("success") else "primary",
+                    use_container_width=True, disabled=not validation_ready,
                 ):
-                    with st.spinner(f"Wystawiam {n_repos_p} PR-ów (po jednym na repo)…"):
-                        for repo, mcs in pending_by_repo.items():
-                            files = [
-                                {"path": mc["file_path"], "content": mc["new_content"],
-                                 "allow_create": mc.get("action") == "create",
-                                 # Treść, na której oparto zmianę — sandbox porówna ją
-                                 # z origin/main i odmówi, gdy plik zdążył się tam zmienić
-                                 # (PR niesie pełny plik, więc cicho skasowałby tamtą zmianę).
-                                 "base_content": mc.get("original") or ""}
-                                for mc in mcs
-                            ]
-                            rs = open_pr_for_files(
-                                files,
-                                pr_title.strip() or f"change: {repo}",
-                                "PR wygenerowany przez shop-qa-ui. Walidacja: bramka preprod-gate.",
-                                f"ai-bot-playground/{repo}",
-                                local_repo=mcs[0]["repo_path"],
+                    _drop_test_env()  # jedno środowisko na raz — poprzednie znika
+                    with st.spinner("Buduję obrazy zmienionych serwisów i wdrażam pełny stos "
+                                    "na osobny namespace (kilka minut)…"):
+                        env = deploy_test_env({
+                            repo: {"repo_path": mcs[0]["repo_path"],
+                                   "files": [{"path": mc["file_path"], "content": mc["new_content"]}
+                                             for mc in mcs]}
+                            for repo, mcs in pending_by_repo.items()
+                        })
+                    st.session_state.qa_test_env = env
+                    st.session_state.qa_po_confirmed = False
+                    if env.get("success"):
+                        with st.spinner("Przygotowuję instrukcję sprawdzenia dla PO…"):
+                            st.session_state.qa_po_checks = propose_po_checks(
+                                question, accepted_proposals,
+                                [f"{r}/{mc['file_path']}" for r, mcs in pending_by_repo.items() for mc in mcs],
+                                env["urls"],
                             )
-                            for mc in mcs:  # ten sam wynik PR dla wszystkich plików repo
-                                mc["pr_result"] = rs
-                    all_attempted = all(
-                        mc.get("pr_result") is not None
-                        for mc in multi if (mc.get("diff") or "").strip()
-                    )
-                    if all_attempted:
-                        st.session_state.sandbox_commit_done = "multi"
-                        # Jeden wpis per repo (nie per plik).
-                        by_repo_pr: dict = {}
-                        for mc in multi:
-                            if not (mc.get("diff") or "").strip():
-                                continue
-                            pr = mc.get("pr_result") or {}
-                            by_repo_pr[mc["repo"]] = {
-                                "repo": mc["repo"],
-                                "repo_slug": f"ai-bot-playground/{mc['repo']}",
-                                "pr_url": pr.get("pr_url", ""),
-                                "branch": pr.get("branch", ""),
-                                "success": pr.get("success", False),
-                                "error": pr.get("error", ""),
-                                "warning": pr.get("warning", ""),
-                                "opened_at": datetime.now().timestamp(),
-                            }
-                        st.session_state.qa_multi_prs = list(by_repo_pr.values())
-                        _advance()
+                        st.session_state.active_tab = "test"
                     st.rerun()
+                if env and not env.get("success"):
+                    st.error(f"Wdrożenie na środowisko testowe nie powiodło się: {env.get('error')}")
+                    with st.expander("Log wdrożenia"):
+                        st.code("\n".join(env.get("log", [])[-80:]), language=None)
+                    if env.get("skipped") and not env.get("images"):
+                        # Np. zmiana wyłącznie w testach akceptacyjnych — PO nie ma czego oglądać.
+                        st.info("Ta zmiana nie dotyczy działającej aplikacji — można od razu wystawić PR.")
+                        pr_title = st.text_input("Tytuł PR / commit", value=(
+                            accepted_proposals[0].get("commit_hint") if accepted_proposals else "change"
+                        ) or "change")
+                        if st.button("🚀 Wystaw PR bez środowiska testowego", use_container_width=True):
+                            with st.spinner("Wystawiam PR-y…"):
+                                done = _open_prs(multi, pr_title,
+                                                 "PR wygenerowany przez shop-qa-ui. Walidacja: bramka preprod-gate.")
+                            if done:
+                                st.session_state.active_tab = "pr"
+                            st.rerun()
             elif not pending and done_prs:
                 if st.button("Przejdź dalej → PR", type="primary"):
-                    _advance()
+                    st.session_state.active_tab = "pr"
+                    st.rerun()
             else:
                 # Model nie zwrócił ANI JEDNEJ zmiany (wszystko puste/identyczne).
                 # Bez tej gałęzi ekran kończył się bez żadnego przycisku i nie
@@ -1195,7 +1311,85 @@ elif active_tab == "sandbox":
             st.stop()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# KROK 4 — PR
+# KROK 4 — Test PO: zmiana działa na środowisku testowym, PO decyduje o PR
+# ═══════════════════════════════════════════════════════════════════════════════
+elif active_tab == "test":
+    st.title("Test na środowisku testowym")
+    env = st.session_state.get("qa_test_env")
+    if st.session_state.get("sandbox_commit_done"):
+        st.success("✅ Product Owner potwierdził zmianę — PR-y są wystawione.")
+        if st.button("Przejdź dalej → PR", type="primary"):
+            st.session_state.active_tab = "pr"
+            st.rerun()
+    elif not env or not env.get("success"):
+        st.info("Brak działającego środowiska testowego — wróć do Piaskownicy i wdróż zmianę "
+                "po zielonej walidacji.")
+    else:
+        question = st.session_state.get("sandbox_question", "")
+        accepted_proposals = st.session_state.get("sandbox_accepted_proposals", [])
+        multi = st.session_state.get("sandbox_multi_changes") or []
+        st.markdown(f"**Żądana zmiana:** {question}")
+        st.caption(
+            f"Namespace `{env['namespace']}` na klastrze `kind-preprod`: pełny stos, zmienione serwisy "
+            "z obrazów kandydackich — " + ", ".join(f"`{r}`" for r in env.get("images", {}))
+            + (f"; niewdrażane: {', '.join(env['skipped'])}" if env.get("skipped") else "")
+        )
+        alive = links_alive(env)
+        col_ui, col_api = st.columns(2)
+        col_ui.link_button("🛒 Otwórz sklep na środowisku testowym", env["urls"]["ui"],
+                           use_container_width=True)
+        col_api.link_button("🔌 API przez gateway", env["urls"]["api"] + "/api/products",
+                            use_container_width=True)
+        if not all(alive.values()):
+            st.warning(f"Linki nie odpowiadają ({', '.join(n for n, ok in alive.items() if not ok)}) — "
+                       "port-forward ginie przy restarcie poda.")
+            if st.button("🔄 Odnów linki"):
+                with st.spinner("Odnawiam połączenie ze środowiskiem…"):
+                    st.session_state.qa_test_env = reconnect_links(env)
+                st.rerun()
+
+        st.markdown("### Co sprawdzić")
+        for i, chk in enumerate(st.session_state.get("qa_po_checks") or [], 1):
+            st.markdown(f"**{i}. {chk['title']}**  \n[{chk['url']}]({chk['url']})  \n"
+                        f"Oczekiwane: {chk['expect']}")
+
+        st.divider()
+        st.markdown("### Decyzja Product Ownera")
+        default_title = (accepted_proposals[0].get("commit_hint") if accepted_proposals else "") or "change"
+        pr_title = st.text_input("Tytuł PR / commit", value=default_title)
+        feedback = st.text_area("Co nie działa? (trafi do agenta jako uwagi do poprawki)",
+                                key="po_feedback_text")
+        col_ok, col_no, col_drop = st.columns(3)
+        if col_ok.button("✅ Działa — wystaw PR", type="primary", use_container_width=True):
+            checks = "\n".join(f"- {c['title']} — {c['expect']}" for c in st.session_state.get("qa_po_checks") or [])
+            body = (
+                "PR wygenerowany przez shop-qa-ui.\n\n"
+                f"Product Owner sprawdził zmianę na środowisku testowym `{env['namespace']}` "
+                f"(kind-preprod) i potwierdził, że działa.\n\n"
+                # Lista to instrukcja od agenta — aplikacja nie wie, które punkty PO faktycznie przeklikał.
+                f"**Instrukcja sprawdzenia przekazana PO:**\n{checks or '- (bez listy)'}\n\n"
+                "Dalej: bramka `preprod-gate`."
+            )
+            with st.spinner("Wystawiam PR-y…"):
+                done = _open_prs(multi, pr_title, body)
+            if done:
+                st.session_state.qa_po_confirmed = True
+                st.session_state.active_tab = "pr"
+            st.rerun()
+        if col_no.button("❌ Nie działa — do poprawki", use_container_width=True):
+            if feedback.strip():
+                st.session_state.sandbox_po_feedback = {"namespace": env["namespace"], "text": feedback.strip()}
+                st.session_state.active_tab = "sandbox"
+                st.rerun()
+            else:
+                st.warning("Opisz, co nie działa — agent poprawi zmianę na tej podstawie.")
+        if col_drop.button("🗑 Usuń środowisko", use_container_width=True):
+            with st.spinner("Usuwam namespace testowy…"):
+                _drop_test_env()
+            st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KROK 5 — PR
 # ═══════════════════════════════════════════════════════════════════════════════
 elif active_tab == "pr":
     st.title("Pull Request")
@@ -1235,21 +1429,14 @@ elif active_tab == "pr":
             gubiłby stan przy każdym odświeżeniu.
             """
             slug = pr["repo_slug"]
-            preview_svc, preview_port = (
-                ("shop-ui", "3001:80") if pr["repo"] == "shop-ui" else ("shop-gateway", "8080:8080")
-            )
-            st.markdown("**Sprawdź na preprod, czy zmiana działa jak chciałeś:**")
-            st.code(
-                f"kubectl --context kind-preprod -n shop port-forward svc/{preview_svc} {preview_port}",
-                language="bash",
-            )
-            st.caption(
-                "Potem: http://localhost:3001 (UI) lub http://localhost:8080/api/products (API)."
-            )
+            if st.session_state.get("qa_po_confirmed"):
+                ns = (st.session_state.get("qa_test_env") or {}).get("namespace", "")
+                st.caption(f"Product Owner potwierdził zmianę na środowisku testowym `{ns}`; "
+                           "bramka sprawdziła ją dodatkowo na preprod z resztą systemu.")
             st.divider()
             st.markdown("**Merge (human-in-the-loop)**")
             confirmed = st.checkbox(
-                "Potwierdzam, że zmiana działa na preprod jak chciałem",
+                "Potwierdzam merge do `main`",
                 key=f"merge_confirm_{slug}",
             )
             if st.button("🔀 Merge PR (squash) do `main`", key=f"merge_btn_{slug}",
@@ -1259,6 +1446,9 @@ elif active_tab == "pr":
                 if result.get("success"):
                     merged[slug] = True
                     st.success("✅ Zmergowano do `main`.")
+                    # Wszystko zmergowane → środowisko testowe PO nie jest już potrzebne.
+                    if all(merged.get(p["repo_slug"]) for p in multi_prs if p["success"]):
+                        _drop_test_env()
                     st.balloons()
                     # scope="app" — pełny rerun, by przeliczyć `awaiting` i zgasić polling.
                     st.rerun(scope="app")

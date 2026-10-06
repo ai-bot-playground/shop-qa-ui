@@ -250,7 +250,21 @@ def _newfile(user_content: str) -> str:
     )
 
 
+def _pochecks(user_content: str) -> str:
+    ui = _field(user_content, "UI")
+    api = _field(user_content, "API")
+    checks = []
+    if ui:
+        checks.append({"title": f"{MARKER} Otwórz sklep", "url": ui,
+                       "expect": "Lista produktów się ładuje."})
+    if api:
+        checks.append({"title": f"{MARKER} Sprawdź API produktów", "url": api.rstrip("/") + "/api/products",
+                       "expect": "JSON z listą produktów."})
+    return json.dumps({"checks": checks}, ensure_ascii=False)
+
+
 _RESPONDERS = {
+    "pochecks": _pochecks,
     "expand": _expand,
     "tech": _tech,
     "biz": _biz,

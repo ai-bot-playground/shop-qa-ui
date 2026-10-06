@@ -114,6 +114,35 @@ class SandboxFlowTests(unittest.TestCase):
         )
 
 
+class LockfileGuardTests(unittest.TestCase):
+    def test_planned_lockfile_is_dropped_from_the_change_set(self):
+        # Przebieg z prawdziwym modelem (06.10): plan dodał vitest do package.json i
+        # package-lock.json — lockfile wracał pusty, recenzent w kółko „niekompletne".
+        from src.ingest import ingest_app
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = _make_workspace(tmp)
+            repo_path = os.path.join(workspace, "shop-payment")
+            app = AppTest.from_file(APP, default_timeout=120)
+            app.session_state["active_tab"] = "sandbox"
+            app.session_state["chunks"] = ingest_app([{"name": "shop-payment", "path": repo_path}])
+            app.session_state["repo_paths"] = {"shop-payment": repo_path}
+            app.session_state["sandbox_question"] = "dodaj opłatę"
+            app.session_state["sandbox_accepted_proposals"] = []
+            app.session_state["sandbox_preload_chunks"] = app.session_state["chunks"]
+            app.session_state["sandbox_plan"] = [
+                {"repo": "shop-payment", "path": "src/main/java/com/shop/payment/PaymentService.java",
+                 "action": "modify", "reason": ""},
+                {"repo": "shop-payment", "path": "package-lock.json", "action": "modify", "reason": ""},
+            ]
+            with mock.patch.dict(os.environ, {"QA_FAKE_LLM": "1", "SHOP_REPOS_DIR": workspace}):
+                app = app.run()
+
+        self.assertFalse(app.exception, app.exception)
+        planned = [c["file_path"] for c in app.session_state["sandbox_multi_changes"]]
+        self.assertEqual(["src/main/java/com/shop/payment/PaymentService.java"], planned)
+
+
 class RepairLoopTests(unittest.TestCase):
     """Naprawa z logu musi sięgać też po pliki z planu, które wróciły puste."""
 
@@ -173,6 +202,134 @@ class RepairLoopTests(unittest.TestCase):
         self.assertIn("FeePolicy", filled["new_content"])
         self.assertTrue(filled["diff"].strip())
         self.assertEqual([[policy, service]], validated, "ponowna walidacja musi objąć dopisany plik")
+
+
+TEST_ENV = {
+    "success": True, "namespace": "test-1006-1200-abcd",
+    "images": {"shop-payment": "localhost/shop-payment:test-1006-1200-abcd"}, "skipped": [],
+    "urls": {"ui": "http://localhost:31001", "api": "http://localhost:31002"},
+    "pids": {"ui": 1, "api": 2}, "log": [], "error": "",
+}
+PO_CHECKS = [{"title": "Kup produkt", "url": "http://localhost:31001/", "expect": "Zakup udany"}]
+
+
+class TestEnvironmentFlowTests(unittest.TestCase):
+    """Wdrożenie na środowisko testowe → PO sprawdza link → dopiero wtedy PR."""
+
+    def _sandbox_app(self, workspace: str, validated: bool) -> AppTest:
+        from src.ingest import ingest_app
+        repo_path = os.path.join(workspace, "shop-payment")
+        service = "src/main/java/com/shop/payment/PaymentService.java"
+        app = AppTest.from_file(APP, default_timeout=120)
+        app.session_state["active_tab"] = "sandbox"
+        app.session_state["chunks"] = ingest_app([{"name": "shop-payment", "path": repo_path}])
+        app.session_state["repo_paths"] = {"shop-payment": repo_path}
+        app.session_state["sandbox_question"] = "dodaj opłatę"
+        app.session_state["sandbox_accepted_proposals"] = [{"title": "Opłata", "description": "x",
+                                                            "commit_hint": "feat: opłata"}]
+        app.session_state["sandbox_preload_chunks"] = app.session_state["chunks"]
+        app.session_state["sandbox_plan"] = [{"repo": "shop-payment", "path": service, "action": "modify"}]
+        app.session_state["sandbox_multi_changes"] = [{
+            "repo": "shop-payment", "file_path": service, "action": "modify", "reason": "",
+            "original": JAVA_SOURCE, "repo_path": repo_path, "new_content": JAVA_SOURCE + "// fee\n",
+            "diff": "--- a\n+++ b\n+// fee", "error": None, "pr_result": None,
+        }]
+        app.session_state["sandbox_validation_results"] = {"shop-payment": {
+            "success": validated, "failure_kind": "" if validated else "code", "project_check": True,
+            "error": "" if validated else "Walidacja nie przeszła (exit 1).", "output": "", "commands": [],
+        }}
+        return app
+
+    def test_deploy_is_blocked_until_local_validation_is_green(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = _make_workspace(tmp)
+            with mock.patch.dict(os.environ, {"QA_FAKE_LLM": "1", "SHOP_REPOS_DIR": workspace}):
+                app = self._sandbox_app(workspace, validated=False).run()
+
+        self.assertFalse(app.exception, app.exception)
+        deploy = next(b for b in app.button if "Wdróż na środowisko testowe" in b.label)
+        self.assertTrue(deploy.disabled)
+        self.assertFalse(any("Wystaw" in b.label for b in app.button),
+                         "PR nie może być dostępny przed testem PO")
+
+    def test_deploy_hands_the_change_to_the_test_environment_and_opens_test_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = _make_workspace(tmp)
+            with mock.patch.dict(os.environ, {"QA_FAKE_LLM": "1", "SHOP_REPOS_DIR": workspace}), \
+                    mock.patch("src.testenv.deploy_test_env", return_value=dict(TEST_ENV)) as deploy, \
+                    mock.patch("src.testenv.links_alive", return_value={"ui": True, "api": True}), \
+                    mock.patch("src.testenv.destroy_test_env"), \
+                    mock.patch("src.agent.propose_po_checks", return_value=PO_CHECKS):
+                app = self._sandbox_app(workspace, validated=True).run()
+                app = next(b for b in app.button if "Wdróż na środowisko testowe" in b.label).click().run()
+
+        self.assertFalse(app.exception, app.exception)
+        changes = deploy.call_args.args[0]
+        self.assertEqual({"shop-payment"}, set(changes))
+        self.assertEqual(["src/main/java/com/shop/payment/PaymentService.java"],
+                         [f["path"] for f in changes["shop-payment"]["files"]])
+        self.assertEqual("test", app.session_state["active_tab"])
+        self.assertEqual(PO_CHECKS, app.session_state["qa_po_checks"])
+
+    def _test_step_app(self, workspace: str) -> AppTest:
+        app = self._sandbox_app(workspace, validated=True)
+        app.session_state["active_tab"] = "test"
+        app.session_state["qa_test_env"] = dict(TEST_ENV)
+        app.session_state["qa_po_checks"] = PO_CHECKS
+        return app
+
+    def test_test_step_gives_the_po_links_and_what_to_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = _make_workspace(tmp)
+            with mock.patch.dict(os.environ, {"QA_FAKE_LLM": "1", "SHOP_REPOS_DIR": workspace}), \
+                    mock.patch("src.testenv.links_alive", return_value={"ui": True, "api": True}):
+                app = self._test_step_app(workspace).run()
+
+        self.assertFalse(app.exception, app.exception)
+        rendered = " ".join(m.value for m in app.markdown)
+        self.assertIn("http://localhost:31001/", rendered)
+        self.assertIn("Zakup udany", rendered)
+        self.assertTrue(any("Działa" in b.label for b in app.button))
+
+    def test_po_confirmation_opens_the_pr_with_the_test_evidence(self):
+        opened = []
+
+        def fake_open_pr(files, title, body, repo_slug, **kwargs):
+            opened.append({"slug": repo_slug, "body": body, "files": [f["path"] for f in files]})
+            return {"success": True, "branch": "ai-change/x", "pr_url": "https://example/pr/1"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = _make_workspace(tmp)
+            with mock.patch.dict(os.environ, {"QA_FAKE_LLM": "1", "SHOP_REPOS_DIR": workspace}), \
+                    mock.patch("src.testenv.links_alive", return_value={"ui": True, "api": True}), \
+                    mock.patch("src.sandbox.open_pr_for_files", side_effect=fake_open_pr), \
+                    mock.patch("src.sandbox.pr_checks", return_value={"available": True, "checks": []}), \
+                    mock.patch("src.sandbox.required_checks", return_value=["preprod-gate / gate"]):
+                app = self._test_step_app(workspace).run()
+                app = next(b for b in app.button if "Działa" in b.label).click().run()
+
+        self.assertFalse(app.exception, app.exception)
+        self.assertEqual(1, len(opened))
+        self.assertEqual("ai-bot-playground/shop-payment", opened[0]["slug"])
+        self.assertIn("test-1006-1200-abcd", opened[0]["body"])
+        self.assertIn("Kup produkt", opened[0]["body"])
+        self.assertTrue(app.session_state["qa_po_confirmed"])
+        self.assertEqual("pr", app.session_state["active_tab"])
+
+    def test_po_rejection_sends_feedback_back_to_the_sandbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = _make_workspace(tmp)
+            with mock.patch.dict(os.environ, {"QA_FAKE_LLM": "1", "SHOP_REPOS_DIR": workspace}), \
+                    mock.patch("src.testenv.links_alive", return_value={"ui": True, "api": True}), \
+                    mock.patch("src.sandbox.open_pr_for_files") as open_pr:
+                app = self._test_step_app(workspace).run()
+                app.text_area(key="po_feedback_text").set_value("Opłata nie pojawia się w koszyku")
+                app = next(b for b in app.button if "Nie działa" in b.label).click().run()
+
+        self.assertFalse(app.exception, app.exception)
+        open_pr.assert_not_called()
+        self.assertEqual("sandbox", app.session_state["active_tab"])
+        self.assertEqual("Opłata nie pojawia się w koszyku", app.session_state["sandbox_po_feedback"]["text"])
 
 
 class PrStepTests(unittest.TestCase):
